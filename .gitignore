@@ -1,2 +1,3 @@
 .env.gemini
 node_modules/*
+workspace/*
