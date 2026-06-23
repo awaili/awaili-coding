@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>About — QUICKPAPA</title>
+  <meta name="description" content="QUICKPAPA is on a mission to make premium sound accessible to everyone.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='24' fill='%237c5cff'/><text x='50' y='72' font-size='60' font-weight='800' text-anchor='middle' fill='%230a0a12' font-family='sans-serif'>Q</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body data-page="about">
+  <div class="ambient"></div>
+  <div id="layout-header"></div>
+
+  <section class="section">
+    <div class="container">
+      <div class="page-hero">
+        <span class="eyebrow"><span class="dot"></span> Our story</span>
+        <h1>Premium sound, for everyone.</h1>
+        <p>QUICKPAPA was born from a simple frustration: great wireless earbuds shouldn't cost a week's salary. We design, tune and ship our own audio — no middlemen, no licensing tax, no $200 markups.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top:0">
+    <div class="container">
+      <div class="split">
+        <div>
+          <h2 style="font-size:clamp(1.8rem,3.5vw,2.4rem);margin-bottom:18px">Sound is personal.</h2>
+          <p class="muted" style="margin-bottom:24px">Our acoustic engineers tune every QUICKPAPA driver by ear, not just by spec sheet. We measure frequency response, then we listen — to strings, to podcasts, to the silence between tracks — until the sound feels right.</p>
+          <ul class="check-list">
+            <li><strong>In-house acoustic tuning</strong> — every model is voiced by our team</li>
+            <li><strong>Direct-to-listener pricing</strong> — no retail middlemen markups</li>
+            <li><strong>Real warranty support</strong> — 12 to 24 months, backed by humans</li>
+            <li><strong>Sustainable packaging</strong> — plastic-free, recyclable, compact</li>
+          </ul>
+        </div>
+        <div class="visual" id="about-visual"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top:0">
+    <div class="container">
+      <div class="section-head">
+        <h2>By the numbers</h2>
+      </div>
+      <div class="feature-grid">
+        <div class="feature-card center"><div class="num" style="font-family:var(--font-display);font-size:2.6rem;font-weight:700;background:var(--gradient-text);-webkit-background-clip:text;background-clip:text;color:transparent">50K+</div><p class="muted" style="margin-top:8px">Happy listeners worldwide</p></div>
+        <div class="feature-card center"><div class="num" style="font-family:var(--font-display);font-size:2.6rem;font-weight:700;background:var(--gradient-text);-webkit-background-clip:text;background-clip:text;color:transparent">4.8★</div><p class="muted" style="margin-top:8px">Average rating across models</p></div>
+        <div class="feature-card center"><div class="num" style="font-family:var(--font-display);font-size:2.6rem;font-weight:700;background:var(--gradient-text);-webkit-background-clip:text;background-clip:text;color:transparent">24mo</div><p class="muted" style="margin-top:8px">Max warranty coverage</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top:0">
+    <div class="container">
+      <div class="cta-banner">
+        <h2>Hear the difference</h2>
+        <p>Try QUICKPAPA risk-free for 30 days. Love them, or send them back.</p>
+        <a class="btn btn-light btn-lg" href="product.html">Shop earbuds</a>
+      </div>
+    </div>
+  </section>
+
+  <div id="layout-footer"></div>
+  <script src="js/store.js"></script>
+  <script src="js/main.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const v = document.getElementById("about-visual");
+      if (v) v.innerHTML = Store.earbudSVG("white");
+    });
+  </script>
+</body>
+</html>

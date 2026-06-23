@@ -1,0 +1,39 @@
+[
+  {
+    "id": "54c78ff1-d383-4603-8fd2-ae86c49b2b41",
+    "cwd": "/data/coding-dev-ui/workspace/tfc",
+    "model": "kimi-k2.7-code:cloud"
+  },
+  {
+    "id": "e6258908-ae1a-4ef9-a8b2-97b220bbc1b6",
+    "cwd": "/data/coding-dev-ui/workspace/tfc",
+    "model": "glm-5.2:cloud"
+  },
+  {
+    "id": "956eb659-2a37-41b8-801f-ba21956b76a3",
+    "cwd": "/data/coding-dev-ui/workspace/tfc",
+    "model": "deepseek-v4-pro:cloud"
+  },
+  {
+    "id": "b79ce2c0-33df-483f-9357-60cf3ec7fe6d",
+    "cwd": "/data/coding-dev-ui/workspace/tfc",
+    "model": "minimax-m3:cloud"
+  },
+  {
+    "id": "7f1c920b-7998-4da7-a36e-6ccb22de0bf2",
+    "cwd": "/data/coding-dev-ui/workspace/wedata",
+    "title": "腾讯云 wedata",
+    "model": "glm-5.2:cloud"
+  },
+  {
+    "id": "677b6a5f-20aa-4457-87a3-89b4e4a6bda0",
+    "cwd": "/data/coding-dev-ui/workspace/gaokao",
+    "model": "glm-5.2:cloud"
+  },
+  {
+    "id": "b165e6a6-9f9e-4510-85d2-dcea6512a7a3",
+    "cwd": "/data/coding-dev-ui/workspace/tfc",
+    "title": "你好",
+    "model": "glm-5.2:cloud"
+  }
+]
