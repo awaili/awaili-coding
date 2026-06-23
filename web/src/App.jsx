@@ -6,6 +6,7 @@ import Composer from "./components/Composer.jsx";
 import FileTree from "./components/FileTree.jsx";
 import Editor from "./components/Editor.jsx";
 import Terminal from "./components/Terminal.jsx";
+import Skills from "./components/Skills.jsx";
 import Login from "./components/Login.jsx";
 
 const empty = [];
@@ -33,6 +34,7 @@ export default function App() {
   const [selectedCwd, setSelectedCwd] = useState("");
   const [status, setStatus] = useState("connecting");
   const [termMode, setTermMode] = useState(null); // null | "tui" | "shell"
+  const [skillsOpen, setSkillsOpen] = useState(false); // Skills manager overlay
   const [editFile, setEditFile] = useState(null); // { path, cwd } when editing a file in main area
   const [authed, setAuthed] = useState(null); // null=checking, false=show login, true=app
   const [toast, setToast] = useState(""); // transient server error banner
@@ -661,6 +663,7 @@ export default function App() {
           </select>
           <button onClick={() => setTermMode("tui")}>TUI</button>
           <button onClick={() => setTermMode("shell")}>Shell</button>
+          <button onClick={() => setSkillsOpen(true)} title="Manage Claude Code skills">Skills</button>
           <button
             className="nav-btn nav-files"
             onClick={() => setNav((n) => (n === "files" ? null : "files"))}
@@ -728,6 +731,10 @@ export default function App() {
             )}
           </div>
         </div>
+      )}
+
+      {skillsOpen && (
+        <Skills cwd={selectedCwd || workspaceRoot} onClose={() => setSkillsOpen(false)} />
       )}
     </div>
   );
