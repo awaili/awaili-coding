@@ -206,7 +206,7 @@ if (isProd) {
   }
 }
 
-const server = app.listen(config.port, () => {
+const server = app.listen(config.port, config.host, () => {
   // eslint-disable-next-line no-console
   console.log(
     `coding-ui server on http://localhost:${config.port} (model=${config.anthropicModel} via ${config.anthropicBaseUrl}) [${isProd ? "prod" : "dev"}]`,

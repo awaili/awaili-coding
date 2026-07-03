@@ -10,9 +10,16 @@ function safeImgSrc(u) {
   return "";
 }
 
+function fmtSize(n) {
+  if (!n || n < 1024) return `${n || 0} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
 export default function Message({ msg }) {
   if (msg.role === "user") {
     const images = Array.isArray(msg.images) ? msg.images : [];
+    const files = Array.isArray(msg.files) ? msg.files : [];
     return (
       <div className="msg user">
         <div className="role">you</div>
@@ -22,6 +29,17 @@ export default function Message({ msg }) {
             <div className="images">
               {images.map((im, i) => (
                 <img key={im.url || im.dataUrl || i} src={safeImgSrc(im.url || im.dataUrl)} alt={im.name || `image-${i + 1}`} />
+              ))}
+            </div>
+          )}
+          {files.length > 0 && (
+            <div className="files">
+              {files.map((f, i) => (
+                <div className="filechip" key={f.name + i} title={f.name}>
+                  <span className="fileicon">📄</span>
+                  <span className="filename">{f.name}</span>
+                  {f.size ? <span className="filesize">{fmtSize(f.size)}</span> : null}
+                </div>
               ))}
             </div>
           )}

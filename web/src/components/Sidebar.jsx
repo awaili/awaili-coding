@@ -4,6 +4,7 @@ export default function Sidebar({
   onPick,
   onNew,
   onRemove,
+  onStop,
   workspaces,
   cwd,
   onPickWorkspace,
@@ -51,6 +52,18 @@ export default function Sidebar({
         >
           <div className="session-row">
             <span className="session-label">{s.title || s.id.slice(0, 8)}</span>
+            {onStop && s.busy && (
+              <button
+                className="session-stop"
+                title="Stop this session"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onStop(s.id);
+                }}
+              >
+                ⏹
+              </button>
+            )}
             {onRemove && (
               <button
                 className="session-rm"

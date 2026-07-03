@@ -44,9 +44,20 @@ export function renderMarkdown(text) {
   const html = marked.parse(text ?? "");
   const str = typeof html === "string" ? html : "";
   return DOMPurify.sanitize(str, {
-    USE_PROFILES: { html: true },
-    // allow target=_blank on links but force rel so it's safe
-    ADD_ATTR: ["target", "rel"],
+    // svg: true keeps inline <svg> geometry/function diagrams authored
+    // directly in .md files. DOMPurify still strips <script>, on* handlers,
+    // javascript: URLs and foreignObject scripts, so authoring static figures
+    // as inline SVG is safe; only standard SVG tags & attributes survive.
+    USE_PROFILES: { html: true, svg: true },
+    // allow target=_blank on links but force rel so it's safe; the rest are
+    // common SVG presentation attributes kept so diagrams render correctly.
+    ADD_ATTR: [
+      "target", "rel",
+      "viewBox", "preserveAspectRatio", "xmlns",
+      "stroke", "stroke-width", "stroke-linecap", "fill", "fill-opacity",
+      "d", "cx", "cy", "r", "rx", "ry", "x", "y", "x1", "x2", "y1", "y2",
+      "width", "height", "points", "transform", "text-anchor", "font-size",
+    ],
   });
 }
 

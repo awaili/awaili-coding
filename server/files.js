@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { readdir, readFile, writeFile, stat, rmdir, rm } from "node:fs/promises";
+import { readdir, readFile, writeFile, stat, rmdir, rm, rename } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { dirname, basename, join, relative, sep } from "node:path";
 import { config } from "./config.js";
@@ -130,6 +130,37 @@ router.delete("/files", async (req, res) => {
     if (target === root) return res.status(400).json({ error: "cannot delete workspace root" });
     await rm(target, { recursive: true, force: false });
     res.json({ ok: true, path: sub });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/files/move { cwd, from, to } -> rename or move a file/folder under
+// the workspace cwd. Confined via safe(); refuses the workspace root, same
+// src/dst, an existing destination, and moving a folder into its own descendant.
+router.post("/files/move", async (req, res) => {
+  const root = confinedCwd(req.body?.cwd);
+  if (!root) return res.status(400).json({ error: "workspace outside WORKSPACE_ROOT" });
+  const from = req.body?.from ? String(req.body.from).replace(/^\/+|\/+$/g, "") : "";
+  const to = req.body?.to ? String(req.body.to).replace(/^\/+|\/+$/g, "") : "";
+  if (!from || !to) return res.status(400).json({ error: "from and to required" });
+  if (from === to) return res.status(400).json({ error: "source and destination are the same" });
+  const src = safe(root, from);
+  const dst = safe(root, to);
+  if (!src || src === root) return res.status(400).json({ error: "source outside workspace" });
+  if (!dst || dst === root) return res.status(400).json({ error: "destination outside workspace" });
+  // Block moving a folder into its own descendant (e.g. a/ -> a/b/c).
+  if (to.startsWith(from + "/")) return res.status(400).json({ error: "cannot move a folder into itself" });
+  try {
+    const st = await stat(dst);
+    return res.status(400).json({ error: "destination already exists" });
+  } catch {
+    // dst absent — fine
+  }
+  try {
+    await mkdirp(dirname(dst));
+    await rename(src, dst);
+    res.json({ ok: true, from, to });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

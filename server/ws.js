@@ -38,7 +38,12 @@ export function attachWebSocket(server) {
 
   wss.on("connection", (ws) => {
     clients.add(ws);
-    ws.send(JSON.stringify({ type: "hello", config: { workspaceRoot: config.workspaceRoot } }));
+    ws.send(
+      JSON.stringify({
+        type: "hello",
+        config: { workspaceRoot: config.workspaceRoot, confirmTools: config.confirmTools, visionModels: config.visionModels },
+      }),
+    );
 
     ws.on("message", (raw) => {
       let msg;
@@ -78,7 +83,7 @@ async function handle(ws, msg) {
       if (!cwd) return ws.send(JSON.stringify({ type: "error", message: "workspace outside WORKSPACE_ROOT" }));
       if (msg.sessionId && !ID_RE.test(msg.sessionId))
         return ws.send(JSON.stringify({ type: "error", message: "invalid sessionId" }));
-      const id = SessionManager.start({ cwd, sessionId: msg.sessionId, model: msg.model });
+      const id = SessionManager.start({ cwd, sessionId: msg.sessionId, model: msg.model, confirm: msg.confirm });
       subscribe(ws, id);
       const sess = SessionManager.get(id);
       ws.send(
@@ -87,14 +92,25 @@ async function handle(ws, msg) {
           sessionId: id,
           cwd,
           model: sess?.model,
+          confirm: !!sess?.confirm,
           resumed: !!msg.sessionId,
         }),
       );
       // On resume, Claude doesn't replay the prior transcript, so load it from
       // the on-disk JSONL log and ship it to the client to populate the view.
+      // Ship only the recent tail (paginated) to keep the WS payload + DOM
+      // small for long sessions; older messages load via `historyMore`.
       if (msg.sessionId) {
-        const messages = SessionManager.history(id);
-        ws.send(JSON.stringify({ type: "history", sessionId: id, messages }));
+        const h = SessionManager.history(id, { limit: config.historyInitialSize });
+        ws.send(
+          JSON.stringify({
+            type: "history",
+            sessionId: id,
+            messages: h.messages,
+            oldestIndex: h.oldestIndex,
+            hasMore: h.hasMore,
+          }),
+        );
       }
       return;
     }
@@ -103,36 +119,53 @@ async function handle(ws, msg) {
       if (!msg.sessionId) return ws.send(JSON.stringify({ type: "error", message: "no sessionId" }));
       if (!ID_RE.test(msg.sessionId)) return ws.send(JSON.stringify({ type: "error", message: "invalid sessionId" }));
       const text = typeof msg.text === "string" ? msg.text : "";
-      // Normalize + validate inline base64 image attachments. Each entry must
-      // be {mediaType:"image/*", data:"<base64 no data: prefix>"}. Cap total
+      // Normalize + validate inline base64 attachments. Each entry is
+      // {mediaType, data:"<base64 no data: prefix>", name?}. image/* entries are
+      // delivered to the model as image content blocks; anything else is read
+      // by Session.send and inlined as a text block (text files) or a note
+      // (binary), so non-image files work even on text-only models. Cap total
       // payload so a huge paste can't blow up the WS frame / spawn stdin.
-      const MAX_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MB of base64 chars
-      const images = [];
+      const MAX_ATTACH_BYTES = 20 * 1024 * 1024; // 20 MB of base64 chars
+      const attachments = [];
       let total = 0;
-      if (Array.isArray(msg.images)) {
-        for (const im of msg.images) {
-          if (!im || typeof im.data !== "string") continue;
-          const mediaType = String(im.mediaType || "");
-          if (!mediaType.startsWith("image/")) continue;
+      if (Array.isArray(msg.attachments)) {
+        for (const att of msg.attachments) {
+          if (!att || typeof att.data !== "string") continue;
+          const mediaType = String(att.mediaType || "");
           // Tolerate a stray data: URL prefix by stripping it.
-          const data = im.data.startsWith("data:") ? im.data.split(",", 2)[1] : im.data;
+          const data = att.data.startsWith("data:") ? att.data.split(",", 2)[1] : att.data;
           if (!data) continue;
           total += data.length;
-          if (total > MAX_IMAGE_BYTES) {
+          if (total > MAX_ATTACH_BYTES) {
             return ws.send(
-              JSON.stringify({ type: "error", message: "image attachments exceed 20 MB total" }),
+              JSON.stringify({ type: "error", message: "attachments exceed 20 MB total" }),
             );
           }
-          images.push({ mediaType, data });
+          attachments.push({ mediaType, data, name: String(att.name || "") });
         }
       }
-      const ok = SessionManager.send(msg.sessionId, text, images);
+      const ok = await SessionManager.send(msg.sessionId, text, attachments);
       if (!ok) ws.send(JSON.stringify({ type: "error", message: "send failed" }));
       return;
     }
 
     case "stop": {
       if (msg.sessionId && ID_RE.test(msg.sessionId)) SessionManager.stop(msg.sessionId);
+      return;
+    }
+
+    case "answer": {
+      // Answer an in-flight control_request (a permission / AskUserQuestion
+      // prompt claude streamed). `response` is the PermissionResult (or
+      // request_user_dialog result) to forward as a control_response on stdin.
+      if (!msg.sessionId || !ID_RE.test(msg.sessionId))
+        return ws.send(JSON.stringify({ type: "error", message: "invalid sessionId" }));
+      if (typeof msg.requestId !== "string" || !msg.requestId)
+        return ws.send(JSON.stringify({ type: "error", message: "answer requires a requestId" }));
+      if (!msg.response || typeof msg.response !== "object")
+        return ws.send(JSON.stringify({ type: "error", message: "answer requires a response object" }));
+      const ok = SessionManager.answerControl(msg.sessionId, msg.requestId, msg.response);
+      if (!ok) ws.send(JSON.stringify({ type: "error", message: "answer failed" }));
       return;
     }
 
@@ -154,21 +187,71 @@ async function handle(ws, msg) {
       // `subscribe` instead to re-attach the listener and replay on-disk history.
       if (!msg.sessionId || !ID_RE.test(msg.sessionId))
         return ws.send(JSON.stringify({ type: "error", message: "invalid sessionId" }));
-      const sess = SessionManager.get(msg.sessionId);
+      let sess = SessionManager.get(msg.sessionId);
       if (!sess) return ws.send(JSON.stringify({ type: "error", message: "no such session" }));
+      // If the process isn't running (never started this boot, or ended/stopped),
+      // (re)start it so the user can continue the conversation. A running background
+      // process is left alone — we only re-attach the listener so its in-flight turn
+      // keeps going (the whole point of background mode). Reusing the instance keeps
+      // the just-attached listener valid for the new process's events.
+      if (!sess.proc || sess.ended) {
+        sess.ended = false;
+        sess.busy = false;
+        sess.bufChunks = [];
+        sess.bufLen = 0;
+        sess.pendingControl = [];
+        sess.start();
+        statusBus.emit("change");
+      }
       subscribe(ws, msg.sessionId);
+      sess = SessionManager.get(msg.sessionId) || sess;
       ws.send(
         JSON.stringify({
           type: "session",
           sessionId: msg.sessionId,
           cwd: sess.cwd,
           model: sess.model,
+          confirm: !!sess.confirm,
           resumed: true,
           busy: !!sess.busy,
         }),
       );
-      const messages = SessionManager.history(msg.sessionId);
-      ws.send(JSON.stringify({ type: "history", sessionId: msg.sessionId, messages }));
+      const h = SessionManager.history(msg.sessionId, { limit: config.historyInitialSize });
+      ws.send(
+        JSON.stringify({
+          type: "history",
+          sessionId: msg.sessionId,
+          messages: h.messages,
+          oldestIndex: h.oldestIndex,
+          hasMore: h.hasMore,
+        }),
+      );
+      return;
+    }
+
+    case "historyMore": {
+      // Fetch an older page of a session's transcript (preceded by the "Load
+      // older" button). `beforeIndex` is the front-indexed cursor of the
+      // oldest message the client currently holds; we return up to
+      // historyPageSize messages ending just before it.
+      if (!msg.sessionId || !ID_RE.test(msg.sessionId))
+        return ws.send(JSON.stringify({ type: "error", message: "invalid sessionId" }));
+      const beforeIndex = Number(msg.beforeIndex);
+      if (!Number.isFinite(beforeIndex) || beforeIndex < 0)
+        return ws.send(JSON.stringify({ type: "error", message: "invalid beforeIndex" }));
+      const h = SessionManager.history(msg.sessionId, {
+        limit: config.historyPageSize,
+        beforeIndex,
+      });
+      ws.send(
+        JSON.stringify({
+          type: "historyMore",
+          sessionId: msg.sessionId,
+          messages: h.messages,
+          oldestIndex: h.oldestIndex,
+          hasMore: h.hasMore,
+        }),
+      );
       return;
     }
 
@@ -205,4 +288,20 @@ function subscribe(ws, sessionId) {
   entry.fn = fn;
   sess.on("event", fn);
   listeners.set(key, entry);
+  // Replay any control_request (permission / AskUserQuestion) prompts that were
+  // emitted while no listener was attached — e.g. a background confirm-mode
+  // session that hit a Write tool while you were viewing another chat. Without
+  // this replay the background claude deadlocks waiting for a control_response
+  // that the user never sees, and re-subscribing wouldn't resurface the prompt
+  // (history only covers completed messages). Use the post-rename `key`.
+  for (const p of sess.pendingControl || []) {
+    if (ws.readyState !== ws.OPEN) break;
+    ws.send(
+      JSON.stringify({
+        type: "claude",
+        data: { type: "control_request", request_id: p.request_id, request: p.request },
+        sessionId: key,
+      }),
+    );
+  }
 }

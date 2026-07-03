@@ -1,13 +1,22 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
-// Composer for a chat turn. Supports text plus image attachments delivered to
-// vision models as Anthropic image content blocks. Images can be pasted from
-// the clipboard, picked from disk, or dragged onto the composer. Attachments
-// are sent inline as base64 in the WS "send" payload (see App.jsx sendMessage
-// and server/ws.js → Session.send).
+function fmtSize(n) {
+  if (!n || n < 1024) return `${n || 0} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// Composer for a chat turn. Supports text plus file attachments. Images are
+// delivered to vision models as Anthropic image content blocks; any other file
+// is read by the backend and inlined as a text block (text files) or a
+// descriptive note (binary), so non-image attachments work even on text-only
+// models. Files can be pasted from the clipboard, picked from disk, or dragged
+// onto the composer. Attachments are sent inline as base64 in the WS "send"
+// payload (see App.jsx sendMessage and server/ws.js → Session.send).
 export default function Composer({ onSend, onStop, busy, disabled }) {
   const [text, setText] = useState("");
-  // attachments: [{id, name, mediaType, dataUrl, data}]  (data = raw base64, no data: prefix)
+  // attachments: [{id, kind:"image"|"file", name, mediaType, dataUrl, data, size}]
+  //   data = raw base64, no data: prefix. dataUrl kept only for image thumbnails.
   const [attachments, setAttachments] = useState([]);
   const [drag, setDrag] = useState(false);
   const ref = useRef(null);
@@ -22,16 +31,15 @@ export default function Composer({ onSend, onStop, busy, disabled }) {
   }, [text]);
 
   const addFiles = useCallback((fileList) => {
-    const MAX_BYTES = 5 * 1024 * 1024; // 5 MB per image — guards the WS frame + spawn stdin
-    const files = Array.from(fileList || []).filter(
-      (f) => f && f.type && f.type.startsWith("image/"),
-    );
+    const MAX_BYTES = 5 * 1024 * 1024; // 5 MB per file — guards the WS frame + spawn stdin
+    const files = Array.from(fileList || []).filter((f) => f);
     if (!files.length) return;
     for (const file of files) {
       if (file.size > MAX_BYTES) {
         window.alert(`"${file.name}" is too large (max 5 MB).`);
         continue;
       }
+      const isImage = file.type && file.type.startsWith("image/");
       const reader = new FileReader();
       reader.onload = () => {
         const dataUrl = String(reader.result || "");
@@ -39,10 +47,18 @@ export default function Composer({ onSend, onStop, busy, disabled }) {
         if (comma < 0) return;
         const header = dataUrl.slice(0, comma); // data:<mediaType>;base64
         const data = dataUrl.slice(comma + 1);
-        const mediaType = header.startsWith("data:") ? header.slice(5).split(";")[0] : file.type;
+        const mediaType = header.startsWith("data:") ? header.slice(5).split(";")[0] : file.type || "";
         setAttachments((prev) => [
           ...prev,
-          { id: ++seq.current, name: file.name, mediaType, dataUrl, data },
+          {
+            id: ++seq.current,
+            kind: isImage ? "image" : "file",
+            name: file.name || (isImage ? "image" : "file"),
+            mediaType: mediaType || (isImage ? "image/png" : "application/octet-stream"),
+            dataUrl: isImage ? dataUrl : "",
+            data,
+            size: file.size,
+          },
         ]);
       };
       reader.onerror = () => {
@@ -76,7 +92,9 @@ export default function Composer({ onSend, onStop, busy, disabled }) {
     if (!items) return;
     const files = [];
     for (const it of items) {
-      if (it.kind === "file" && it.type && it.type.startsWith("image/")) {
+      // Any pasted file is accepted — images render as thumbnails, other files
+      // as chips. Skip pure text items so normal paste-into-textarea still works.
+      if (it.kind === "file") {
         const f = it.getAsFile();
         if (f) files.push(f);
       }
@@ -107,25 +125,39 @@ export default function Composer({ onSend, onStop, busy, disabled }) {
     >
       {attachments.length > 0 && (
         <div className="previews">
-          {attachments.map((a) => (
-            <div className="preview" key={a.id} title={a.name}>
-              <img src={a.dataUrl} alt={a.name} />
-              <button
-                className="rm"
-                onClick={() => removeAttachment(a.id)}
-                title="Remove attachment"
-              >
-                ×
-              </button>
-            </div>
-          ))}
+          {attachments.map((a) =>
+            a.kind === "image" ? (
+              <div className="preview" key={a.id} title={a.name}>
+                <img src={a.dataUrl} alt={a.name} />
+                <button
+                  className="rm"
+                  onClick={() => removeAttachment(a.id)}
+                  title="Remove attachment"
+                >
+                  ×
+                </button>
+              </div>
+            ) : (
+              <div className="preview file" key={a.id} title={a.name}>
+                <span className="fileicon">📄</span>
+                <span className="filename">{a.name}</span>
+                <span className="filesize">{fmtSize(a.size)}</span>
+                <button
+                  className="rm"
+                  onClick={() => removeAttachment(a.id)}
+                  title="Remove attachment"
+                >
+                  ×
+                </button>
+              </div>
+            ),
+          )}
         </div>
       )}
       <div className="row">
         <input
           ref={fileRef}
           type="file"
-          accept="image/*"
           multiple
           style={{ display: "none" }}
           onChange={(e) => {
@@ -137,7 +169,7 @@ export default function Composer({ onSend, onStop, busy, disabled }) {
           className="attach"
           onClick={() => fileRef.current?.click()}
           disabled={disabled}
-          title="Attach images (or paste / drag them in)"
+          title="Attach files (or paste / drag them in)"
         >
           📎
         </button>
@@ -150,7 +182,7 @@ export default function Composer({ onSend, onStop, busy, disabled }) {
           placeholder={
             disabled
               ? "Start a session first…"
-              : "Message Claude Code…  (Enter to send, Shift+Enter for newline, paste/drop images for vision models)"
+              : "Message Claude Code…  (Enter to send, Shift+Enter for newline, paste/drop files or images)"
           }
           disabled={disabled}
         />
