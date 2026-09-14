@@ -1,11 +1,13 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 import { config, childEnv } from "./config.js";
 import { buildClaudeArgs } from "./claude-args.js";
 import { availableSkillsForCwd, pickSkill } from "./skills.js";
+import { isVisionModel } from "./catalog.js";
+import { transcribeImages } from "./vision.js";
 
 const STATE_FILE = resolve(config.workspaceRoot, ".coding-ui-sessions.json");
 
@@ -24,17 +26,74 @@ function emitStatus() {
 }
 
 // Claude Code stores each session's full transcript as JSONL under
-// ~/.claude/projects/<cwd-with-slashes-as-dashes>/<sessionId>.jsonl. We read it
-// to show prior conversation when a session is resumed (--resume does NOT replay
-// history in stream-json print mode, so without this the main area stays empty).
+// ~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl. The sanitizer turns
+// path separators AND underscores/dots into dashes, so a cwd like
+// /data/.../idc_migrate lands in a dir named ...-idc-migrate (hyphen, not
+// underscore). Mirror that here, or every session under an underscore- or
+// dot-named workspace looks "no transcript" and shows empty / gets pruned.
+// We read it to show prior conversation when a session is resumed (--resume
+// does NOT replay history in stream-json print mode, so without this the main
+// area stays empty).
 // sessionId is joined into a path, so reject anything outside a safe charset
 // (defense in depth — the HTTP caller is also validated upstream).
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 function sessionLogPath(cwd, sessionId) {
   const sid = String(sessionId || "");
   if (!ID_RE.test(sid)) return null; // caller treats null as "no transcript"
-  const enc = String(cwd).replace(/\//g, "-");
+  const enc = String(cwd).replace(/[\/\\._]/g, "-");
   return join(homedir(), ".claude", "projects", enc, `${sid}.jsonl`);
+}
+
+// Total base64 bytes of image blocks embedded in a session's transcript —
+// both pasted images (user content blocks) and tool results (e.g. a browser
+// driver whose screenshots get Read back as image blocks; that flow produced a
+// 41MB transcript whose every turn then 400s at the gateway). Every turn
+// re-sends the whole history, and the gateway refuses to READ request bodies
+// at 16MB (see config.imageBudgetBytes), so send() uses this to decide whether
+// embedding yet another image would push the session past what can ever be
+// transported again. Cached on (size, mtime) so a send doesn't rescan a 40MB
+// transcript on every message; a miss rescans once.
+const imageBytesCache = new Map();
+function embeddedImageBytes(cwd, sessionId) {
+  const path = sessionLogPath(cwd, sessionId);
+  if (!path) return 0;
+  let st;
+  try {
+    st = statSync(path);
+  } catch {
+    return 0;
+  }
+  const cached = imageBytesCache.get(path);
+  if (cached && cached.size === st.size && cached.mtime === st.mtimeMs) return cached.bytes;
+  let bytes = 0;
+  try {
+    for (const line of readFileSync(path, "utf8").split("\n")) {
+      if (!line.includes('"image"')) continue; // fast skip of non-image records
+      let r;
+      try {
+        r = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (r.isSidechain || r.type !== "user") continue;
+      const countBlocks = (blocks) => {
+        for (const b of blocks || []) {
+          if (!b || typeof b !== "object") continue;
+          if (b.type === "image" && b.source?.type === "base64" && typeof b.source.data === "string") {
+            bytes += b.source.data.length;
+          } else if (b.type === "tool_result" && Array.isArray(b.content)) {
+            countBlocks(b.content); // tool results can carry image blocks too
+          }
+        }
+      };
+      countBlocks(Array.isArray(r.message?.content) ? r.message.content : []);
+    }
+  } catch {
+    // unreadable transcript: treat as 0 — worst case we embed and let the
+    // gateway's own (detected) error surface.
+  }
+  imageBytesCache.set(path, { size: st.size, mtime: st.mtimeMs, bytes });
+  return bytes;
 }
 
 // Build a message list in the shape the web frontend already uses internally
@@ -195,6 +254,7 @@ function loadState() {
         const sess = new Session({ id: s.id, cwd: s.cwd, resume: s.id, model: s.model, confirm: s.confirm });
         sess.title = s.title;
         sess.createdAt = s.createdAt;
+        sess.metrics = s.metrics || null;
         sessions.set(s.id, sess);
       }
       // Rewrite the file without the pruned entries.
@@ -215,13 +275,14 @@ function saveStateNow() {
     clearTimeout(saveTimer);
     saveTimer = null;
   }
-  const arr = [...sessions.values()].map(({ id, cwd, title, createdAt, model, confirm }) => ({
+  const arr = [...sessions.values()].map(({ id, cwd, title, createdAt, model, confirm, metrics }) => ({
     id,
     cwd,
     title,
     createdAt,
     model,
     confirm,
+    metrics: metrics || null,
   }));
   try {
     mkdirSync(config.workspaceRoot, { recursive: true });
@@ -239,6 +300,24 @@ function saveState() {
 }
 // NOTE: loadState() is invoked after the Session class below — class
 // declarations are not hoisted, so it can't run before Session is defined.
+
+// Pull the display-relevant metrics out of a stream-json `result` event. The
+// usage.* token counts are for the LAST turn only; total_cost_usd, duration_ms
+// and num_turns are cumulative across the whole session (claude accumulates
+// them, so we just take its value rather than re-summing). Returns null only
+// if the event is malformed — a normal result always has usage + totals.
+function extractMetrics(evt) {
+  const u = evt && evt.usage ? evt.usage : {};
+  return {
+    inputTokens: u.input_tokens || 0,
+    outputTokens: u.output_tokens || 0,
+    cacheReadTokens: u.cache_read_input_tokens || 0,
+    cacheCreationTokens: u.cache_creation_input_tokens || 0,
+    totalCostUsd: typeof evt.total_cost_usd === "number" ? evt.total_cost_usd : null,
+    totalDurationMs: typeof evt.duration_ms === "number" ? evt.duration_ms : null,
+    totalTurns: typeof evt.num_turns === "number" ? evt.num_turns : null,
+  };
+}
 
 class Session extends EventEmitter {
   constructor({ id, cwd, resume, model, confirm }) {
@@ -269,6 +348,15 @@ class Session extends EventEmitter {
     // control_response that will never come. Cleared on result (turn done) and
     // when a specific request is answered/cancelled.
     this.pendingControl = [];
+    // Metrics from the last `result` event (one per completed turn). Carries
+    // the last turn's token breakdown (usage.*) plus the session-cumulative
+    // cost/duration/turns that claude reports authoritatively — total_cost_usd,
+    // duration_ms and num_turns are cumulative across the WHOLE session, not
+    // per-turn. Persisted so a resumed session shows its last-known metrics
+    // until the next turn refreshes them; the on-disk transcript does NOT store
+    // the result event, so without persisting here the metrics are lost on
+    // restart and the UI has nothing to show for past sessions.
+    this.metrics = null;
   }
 
   // Child env with this session's model overriding the global default. All four
@@ -285,6 +373,16 @@ class Session extends EventEmitter {
   }
 
   start() {
+    // Recompute --resume at spawn time from the transcript's existence. A
+    // session created as a new chat is constructed with resume:undefined and
+    // this.resume was never refreshed, so reactivating it after its process
+    // died (idle reaper, exit) used to spawn `--session-id <id>` again — which
+    // claude ≥2.1.268 REFUSES once <id>.jsonl exists ("Session ID ... is
+    // already in use") and exits immediately, leaving the session impossible
+    // to reopen. The transcript is the source of truth: if it's there, this
+    // session has history and must be resumed, never restarted fresh.
+    const logPath = sessionLogPath(this.cwd, this.id);
+    this.resume = logPath && existsSync(logPath) ? this.id : undefined;
     const args = buildClaudeArgs({ cwd: this.cwd, resume: this.resume, id: this.id, confirm: this.confirm });
     let proc;
     try {
@@ -395,6 +493,8 @@ class Session extends EventEmitter {
       this.busy = false;
       this.pendingControl = [];
       this.lastActivity = Date.now();
+      this.metrics = extractMetrics(evt);
+      saveState();
       emitStatus();
     }
     // Track in-flight control requests so they can be replayed to a client that
@@ -408,6 +508,42 @@ class Session extends EventEmitter {
       }
     } else if (evt.type === "control_cancel_request" && evt.request_id) {
       this.pendingControl = this.pendingControl.filter((p) => p.request_id !== evt.request_id);
+    }
+    // A gateway that rejects image blocks surfaces as an ordinary `assistant`
+    // message whose text is "API Error: 400 {...this model does not support
+    // image input...}" — the CLI synthesizes it, so it renders as a normal
+    // bubble with no hint of what to do about it. Flag it so the UI can offer
+    // a way out. Requiring the specific phrase (not just /image/) keeps a model
+    // that merely *quotes* this error from tripping it.
+    if (
+      evt.type === "assistant" &&
+      evt.error === "invalid_request" &&
+      /does not support image input/i.test(
+        (evt.message?.content || [])
+          .filter((b) => b && b.type === "text")
+          .map((b) => b.text || "")
+          .join(" "),
+      )
+    ) {
+      this.emit("event", { type: "vision-unsupported", sessionId: this.id, model: this.model });
+    }
+    // Same shape, different disease: the gateway (Ollama 0.34.0) refuses to
+    // even READ a request body at 16MB, and every turn re-sends the whole
+    // history — so a session that accumulated too many embedded images (see
+    // config.imageBudgetBytes) or other huge content fails EVERY message with
+    // "failed to read request body" and retrying can never help. Flag it so
+    // the UI can tell the user the way out is a fresh session (the old
+    // transcript, images included, stays viewable).
+    if (
+      evt.type === "assistant" &&
+      /failed to read request body/i.test(
+        (evt.message?.content || [])
+          .filter((b) => b && b.type === "text")
+          .map((b) => b.text || "")
+          .join(" "),
+      )
+    ) {
+      this.emit("event", { type: "payload-too-large", sessionId: this.id, model: this.model });
     }
     // Remember the real session id once init fires (for fresh sessions).
     if (evt.type === "system" && evt.subtype === "init" && evt.session_id) {
@@ -428,10 +564,26 @@ class Session extends EventEmitter {
     this.emit("event", { type: "claude", data: evt, sessionId: this.id });
   }
 
-  async send(text, attachments = []) {
+  async send(text, attachments = [], uid) {
     if (!this.proc || this.ended) {
       this.emit("event", { type: "error", sessionId: this.id, message: "session is not running" });
       return false;
+    }
+    // Catch-all early warning: the transcript's total size approximates what
+    // every turn re-sends, whatever accumulated it — pasted images, tool-
+    // result screenshots (a browser driver's PNGs Read back as image blocks),
+    // giant dumps. Past the budget the session is one 16MB gateway read away
+    // from a hard 400 no retry can fix, so tell the user once, before it
+    // breaks. (The embed-vs-transcribe guard below handles new images; this
+    // covers sources the server can't intercept.)
+    try {
+      const log = sessionLogPath(this.cwd, this.id);
+      if (log && !this.limitWarned && statSync(log).size > config.imageBudgetBytes) {
+        this.limitWarned = true;
+        this.emit("event", { type: "payload-near-limit", sessionId: this.id });
+      }
+    } catch {
+      // no transcript yet (fresh session) — nothing to warn about
     }
     // Build the Anthropic content array. Text block first (if any), then one
     // block per attachment: image/* → image content block (vision models);
@@ -458,17 +610,95 @@ class Session extends EventEmitter {
       }
     }
     if (userText.length > 0) content.push({ type: "text", text: userText });
+
+    // An image block is only legal for a model that accepts image input — the
+    // gateway hard-400s otherwise ("this model does not support image input").
+    // The model is fixed for the lifetime of this process, so rather than
+    // restart the session onto a vision model (which used to silently move the
+    // user's whole conversation onto a weaker coding model), transcribe the
+    // images with a vision model and forward the TEXT. The chosen model keeps
+    // doing the coding; it just receives the image as words. See vision.js.
+    const images = attachments.filter(
+      (a) =>
+        a && typeof a.data === "string" && a.data && String(a.mediaType || "").startsWith("image/"),
+    );
+    let visionOk = true;
+    let overBudget = false;
+    if (images.length) {
+      visionOk = await isVisionModel(this.model);
+      if (visionOk) {
+        // Transport guard: even a vision-capable model can't keep taking raw
+        // image blocks forever — each one is embedded in the transcript and
+        // re-sent on every turn, and the gateway stops READING the request at
+        // 16MB (see config.imageBudgetBytes). Once stored + incoming images
+        // would cross the budget, transcribe instead of embed: the session
+        // keeps working, the model just receives later screenshots as words.
+        const incoming = images.reduce((n, a) => n + a.data.length, 0);
+        if (embeddedImageBytes(this.cwd, this.id) + incoming > config.imageBudgetBytes) {
+          visionOk = false;
+          overBudget = true;
+        }
+      }
+      if (!visionOk) {
+        const describeModel = config.visionDescribeModel;
+        // Mark busy before the (multi-second) transcription so the UI shows
+        // work in progress and the idle reaper doesn't stop us mid-flight.
+        this.busy = true;
+        this.lastActivity = Date.now();
+        emitStatus();
+        this.emit("event", {
+          type: "vision-transcribing",
+          sessionId: this.id,
+          uid,
+          model: describeModel,
+          count: images.length,
+        });
+        try {
+          const r = await transcribeImages(images, { model: describeModel });
+          const note = overBudget
+            ? `会话累计图片体积已接近网关请求上限，改用转写以防请求体被拒`
+            : "";
+          content.push({
+            type: "text",
+            text: `[图片转写 · ${r.model}${note ? ` · ${note}` : ""}]\n${r.text}`,
+          });
+          this.emit("event", {
+            type: "vision-transcribed",
+            sessionId: this.id,
+            uid,
+            model: r.model,
+            count: images.length,
+            truncated: r.truncated,
+            text: r.text,
+          });
+        } catch (err) {
+          // Nothing was sent, so don't leave the session wedged as busy.
+          this.busy = false;
+          emitStatus();
+          const why = overBudget
+            ? `会话累计图片体积已达网关请求上限，需转写但转写失败了（${err.message}）。` +
+              `请新开会话，或改用文字描述。`
+            : `当前模型 ${this.model} 不支持图片，自动转写也失败了（${err.message}）。` +
+              `请切换到 ${describeModel} 或改用文字描述。`;
+          this.emit("event", { type: "error", sessionId: this.id, message: why });
+          return false;
+        }
+      }
+    }
+
     for (const att of attachments) {
       if (!att || typeof att.data !== "string" || !att.data) continue;
       const mediaType = String(att.mediaType || "");
       const name = String(att.name || "");
       if (mediaType.startsWith("image/")) {
-        // Image content block — only consumed by vision-capable models; the UI
-        // auto-switches to a vision model before sending (see App.jsx).
-        content.push({
-          type: "image",
-          source: { type: "base64", media_type: mediaType, data: att.data },
-        });
+        // Reachable only for a vision-capable model; a text-only one already
+        // got the transcription pushed above (and must NOT get an image block).
+        if (visionOk) {
+          content.push({
+            type: "image",
+            source: { type: "base64", media_type: mediaType, data: att.data },
+          });
+        }
         continue;
       }
       // Non-image: decode and inline as text if it looks textual, else a note.
@@ -677,6 +907,13 @@ export const SessionManager = {
       const nextConfirm = confirm === undefined ? s.confirm : !!confirm;
       const resume = existsSync(sessionLogPath(s.cwd, sessionId) || "") ? sessionId : undefined;
       const sess = new Session({ id: sessionId, cwd: s.cwd, resume, model: nextModel, confirm: nextConfirm });
+      // The restart replaces the map entry with a fresh Session object, so
+      // carry over everything the constructor doesn't take — otherwise a
+      // model/confirm switch resets the sidebar row to "(no title)" and
+      // drops the persisted metrics.
+      sess.title = s.title;
+      sess.createdAt = s.createdAt;
+      sess.metrics = s.metrics || null;
       sessions.set(sessionId, sess);
       if (nextModel !== s.model || nextConfirm !== s.confirm) saveState();
       sess.start();
@@ -708,7 +945,7 @@ export const SessionManager = {
     return id;
   },
 
-  async send(sessionId, text, attachments = []) {
+  async send(sessionId, text, attachments = [], uid) {
     const s = sessions.get(sessionId);
     if (!s) return false;
     if (s.title === undefined) {
@@ -717,7 +954,7 @@ export const SessionManager = {
       s.title = t ? t.slice(0, 60) : n ? `[${n} attachment${n > 1 ? "s" : ""}]` : "(empty)";
       saveState();
     }
-    return s.send(text, attachments);
+    return s.send(text, attachments, uid);
   },
 
   stop(sessionId) {
@@ -757,7 +994,7 @@ export const SessionManager = {
   },
 
   list() {
-    return [...sessions.values()].map(({ id, cwd, title, createdAt, model, busy, ended, confirm }) => ({
+    return [...sessions.values()].map(({ id, cwd, title, createdAt, model, busy, ended, confirm, metrics }) => ({
       id,
       cwd,
       title,
@@ -766,6 +1003,7 @@ export const SessionManager = {
       busy: !!busy,
       ended: !!ended,
       confirm: !!confirm,
+      metrics: metrics || null,
     }));
   },
 

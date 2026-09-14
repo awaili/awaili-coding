@@ -38,15 +38,39 @@ export const config = {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
-  // Models on this gateway that accept image (vision) input. When a message
-  // carries image attachments and the active session's model isn't in this list,
-  // the UI auto-restarts the session under the first entry (e.g. gemma4:31b-cloud)
-  // before delivering the message — text-only models like glm-5.2:cloud 400 on
-  // image blocks. Comma-separated; first entry is the auto-switch target.
+  // Force-include list of models that accept image (vision) input. Capability
+  // is auto-detected from the gateway (see catalog.js — /api/tags and /api/show
+  // both report a `capabilities` array containing "vision"), so this is only an
+  // override for gateways that don't report capabilities, NOT the source of
+  // truth it used to be. Comma-separated.
   visionModels: (process.env.VISION_MODELS || "gemma4:31b-cloud")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
+  // Force-EXCLUDE list, for a model that reports "vision" but whose gateway
+  // rejects image blocks anyway (detection can only trust what it's told).
+  // Wins over both auto-detection and visionModels above. Comma-separated.
+  visionModelsExclude: (process.env.VISION_MODELS_EXCLUDE || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+  // The vision model used to transcribe images for text-only models: when a
+  // message carries images and the session's model can't take them, the server
+  // calls this model to turn the images into text and forwards THAT (see
+  // vision.js + sessions.js send()). Keeps the user's chosen coding model in
+  // place instead of restarting the session onto a vision model. Must itself be
+  // vision-capable.
+  visionDescribeModel: process.env.VISION_DESCRIBE_MODEL || "gemma4:31b-cloud",
+  // Cumulative byte budget for base64 image blocks embedded in one session's
+  // transcript. Every turn re-sends the whole history, and the gateway
+  // (Ollama 0.34.0 /v1/messages) refuses to even READ a request body at
+  // 16MB — so a session that keeps pasting screenshots for a vision-capable
+  // model eventually crosses it and every subsequent message fails with
+  // "failed to read request body" (400). Auto-compact can't catch this: it
+  // counts tokens (~1.6K per image), not transport bytes. Once the session's
+  // stored images plus this message's would exceed the budget, new images are
+  // transcribed to text instead of embedded, bounding history growth.
+  imageBudgetBytes: (Number(process.env.SESSION_IMAGE_BUDGET_MB) || 12) * 1024 * 1024,
   disableBetas: process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS || "1",
   port: Number(process.env.PORT) || 3001,
   // 仅监听回环口，避免后端绕过 nginx 直接暴露在 0.0.0.0（明文 HTTP + 跳过 TLS）。

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useSocket } from "./hooks/useSocket.js";
 import Sidebar from "./components/Sidebar.jsx";
 import Message from "./components/Message.jsx";
@@ -11,6 +11,34 @@ import Skills from "./components/Skills.jsx";
 import Login from "./components/Login.jsx";
 
 const empty = [];
+
+// Format a USD cost: show enough precision that sub-cent per-turn costs are
+// visible, but don't spam trailing zeros for larger totals.
+function formatCost(usd) {
+  if (usd == null) return null;
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  if (usd < 1) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+// Format a millisecond duration as e.g. "1.2s" / "47s" / "3m12s".
+function formatDuration(ms) {
+  if (ms == null) return null;
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
+  const m = Math.floor(s / 60);
+  const rem = Math.round(s % 60);
+  return `${m}m${rem}s`;
+}
+
+// Compact integer with k/m suffix for token counts.
+function formatTokens(n) {
+  if (!n) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}m`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
 
 // Derive a workspace's folder name from its absolute path (null for the root
 // workspace, which is not deletable).
@@ -53,6 +81,59 @@ function normalizeHistMsg(m) {
   return m;
 }
 
+// One-line metrics bar shown above the composer for the active session. Splits
+// into "this turn" (token breakdown from the last result's usage.*) and
+// "session" (cumulative cost/duration/turns claude reports in the same event).
+// Hidden until the first turn completes (no metrics yet).
+// What the model actually received for an image it can't see natively: the
+// server transcribed the image with a vision model and forwarded that text.
+// The step is lossy (a summarizer would drop the exact identifiers that make a
+// stack trace useful), so the result stays inspectable rather than hidden —
+// collapsed by default to keep the transcript readable.
+function VisionNote({ note }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="vision-note">
+      <button className="vision-note-head" onClick={() => setOpen((o) => !o)}>
+        🖼 已由 {note.model} 转写为文字{note.truncated ? "（内容被截断）" : ""} · {open ? "收起" : "查看"}
+      </button>
+      {open && <pre className="vision-note-body">{note.text}</pre>}
+    </div>
+  );
+}
+
+function MetricsBar({ metrics }) {
+  if (!metrics) return null;
+  const inT = metrics.inputTokens || 0;
+  const outT = metrics.outputTokens || 0;
+  const cacheR = metrics.cacheReadTokens || 0;
+  const cacheW = metrics.cacheCreationTokens || 0;
+  const cost = formatCost(metrics.totalCostUsd);
+  const dur = formatDuration(metrics.totalDurationMs);
+  const turns = metrics.totalTurns;
+  return (
+    <div className="metrics-bar" title="Last-turn tokens · cumulative session cost / duration / turns">
+      <span className="metrics-label">last turn</span>
+      <span className="metrics-pair" title={`input ${inT} · output ${outT} · cache read ${cacheR} · cache write ${cacheW}`}>
+        <span className="metrics-tok-in">↑{formatTokens(inT)}</span>
+        <span className="metrics-tok-out">↓{formatTokens(outT)}</span>
+        {(cacheR || cacheW) > 0 && (
+          <span className="metrics-tok-cache" title="cache read / write tokens">
+            ⚡{formatTokens(cacheR + cacheW)}
+          </span>
+        )}
+      </span>
+      <span className="metrics-sep">·</span>
+      <span className="metrics-label">session</span>
+      <span className="metrics-pair">
+        {cost != null && <span title="cumulative cost">{cost}</span>}
+        {dur != null && <span title="cumulative wall-clock duration">{dur}</span>}
+        {turns != null && <span title="cumulative turns">{turns}t</span>}
+      </span>
+    </div>
+  );
+}
+
 export default function App() {
   const [sessions, setSessions] = useState([]);
   const [activeId, setActiveId] = useState(null);
@@ -63,6 +144,12 @@ export default function App() {
   // to fetch the next older page via `historyMore`.
   const [historyMetaBy, setHistoryMetaBy] = useState({});
   const [busyBy, setBusyBy] = useState({}); // {sessionId: bool}
+  // Per-session metrics from the last completed turn (tokens for that turn +
+  // session-cumulative cost/duration/turns). Populated from the `result`
+  // stream event (live) and the `sessions` broadcast (restored from disk on
+  // reconnect). Surfaced in a metrics bar under the active chat and as a
+  // cost line in each sidebar row.
+  const [metricsBy, setMetricsBy] = useState({}); // {sessionId: metrics}
   const [promptsBy, setPromptsBy] = useState({}); // {sessionId: [{requestId, request}]}
   const [confirmMode, setConfirmMode] = useState(false); // interactive confirm mode for new chats
   const [visionModels, setVisionModels] = useState([]); // gateway models that accept image input
@@ -90,10 +177,12 @@ export default function App() {
   const suppressAutoScrollRef = useRef(false);
   const prependRestoreRef = useRef(null); // { prev: scrollHeight, sessionId }
   const toastTimer = useRef(null);
-  // Holds a message (text + image attachments) while we restart the active
-  // session under a vision model so it can process the images. Delivered once the
-  // new process is ready (the `history` event after the resume-restart).
-  const pendingVisionSendRef = useRef(null);
+  // Transcriptions of images that were sent to a text-only model, keyed by
+  // session id and then by the user message's uid, so each note renders under
+  // the exact message it belongs to. The transcription step is lossy, so what
+  // the model actually received has to stay inspectable.
+  const [visionNotes, setVisionNotes] = useState({}); // {sessionId: {uid: {model, text, truncated}}}
+  const [describeModel, setDescribeModel] = useState(""); // vision model used to transcribe images
 
   function flashToast(msg) {
     setToast(msg);
@@ -132,13 +221,18 @@ export default function App() {
   // Load the selectable model list once authenticated. The backend sources it
   // live from Ollama's /api/tags (falling back to the configured list), so the
   // dropdown reflects what's actually installed. Any model seen on a session
-  // is also added so resumed sessions stay selectable.
+  // is also added so resumed sessions stay selectable. The same response
+  // carries which models accept images (detected from the gateway) and which
+  // model the server transcribes images with — both authoritative, so they
+  // override the `hello` frame's configured fallback.
   function refreshModels(initial = false) {
     fetch("/api/models")
       .then((r) => r.json())
       .then((j) => {
         const list = Array.isArray(j.models) && j.models.length ? j.models : [j.default || "glm-5.2:cloud"];
         setDefaultModel(j.default || list[0]);
+        if (Array.isArray(j.visionModels)) setVisionModels(j.visionModels);
+        if (j.describeModel) setDescribeModel(j.describeModel);
         setModelOptions((opts) => {
           const merged = [...list];
           // Preserve the active model and the chosen "next chat" model if Ollama's
@@ -172,7 +266,11 @@ export default function App() {
         setWorkspaceRoot(evt.config?.workspaceRoot || "");
         setStatus("ready");
         setConfirmMode(!!evt.config?.confirmTools);
-        setVisionModels(Array.isArray(evt.config?.visionModels) ? evt.config.visionModels : []);
+        // Configured fallback only — /api/models carries the detected list and
+        // wins if it has already landed (see refreshModels).
+        setVisionModels((prev) =>
+          prev.length || !Array.isArray(evt.config?.visionModels) ? prev : evt.config.visionModels,
+        );
         refreshWorkspaces(evt.config?.workspaceRoot || "");
         sendRef.current?.({ type: "list" });
         break;
@@ -192,6 +290,19 @@ export default function App() {
             const ex = byId.get(s.id);
             return ex ? { ...ex, ...s } : s;
           });
+        });
+        // The server's list() carries each session's persisted metrics, so a
+        // page reload / reconnect repopulates the metrics bar for sessions the
+        // user isn't actively watching (whose result events this client never
+        // saw). Don't clobber a fresher value we just applied from a live
+        // result event — only set when the server actually has metrics.
+        setMetricsBy((p) => {
+          let next = p;
+          for (const s of evt.items || []) {
+            if (!s.metrics) continue;
+            next = { ...next, [s.id]: s.metrics };
+          }
+          return next;
         });
         // The session list is the server's authoritative busy/ended state
         // (broadcast on every status change). Sync the composer's busy map from
@@ -250,19 +361,6 @@ export default function App() {
         // A fresh history load should pin to the bottom; clear any stale
         // suppress flag from a prior "Load older" in another session.
         suppressAutoScrollRef.current = false;
-        // After a vision-model restart (triggered by sendMessage when an image
-        // was sent to a text-only model), deliver the held message now that the
-        // new process is ready and the transcript has been reloaded. Flushing
-        // here (not in the `session` handler) because `history` replaces
-        // msgs[sessionId], which would wipe an earlier optimistic render. Only
-        // flush for the session the held send was bound to — a `history` for any
-        // other session (user navigated away, or a prior restart's ref leaked)
-        // must NOT trigger delivery into the wrong conversation.
-        const held = pendingVisionSendRef.current;
-        if (held && held.sessionId === evt.sessionId) {
-          pendingVisionSendRef.current = null;
-          deliverSend(held.text, held.attachments);
-        }
         break;
       case "historyMore": {
         // An older page of the transcript (preceded by the "Load older"
@@ -319,16 +417,50 @@ export default function App() {
         // (the process is gone), so drop them so the cards don't linger.
         setPromptsBy((p) => (p[evt.sessionId] ? { ...p, [evt.sessionId]: [] } : p));
         setSessions((cur) => cur.map((s) => (s.id === evt.sessionId ? { ...s, ended: true } : s)));
-        // If the vision-model restart died before its `history` flushed the
-        // held image send, drop it now (with a toast) instead of leaving it
-        // pending — otherwise the next `history` (e.g. opening another chat)
-        // would deliver the images into the wrong conversation.
-        if (pendingVisionSendRef.current && pendingVisionSendRef.current.sessionId === evt.sessionId) {
-          pendingVisionSendRef.current = null;
-          flashToast("Vision restart failed — re-send your message with the image.");
-        }
         if (evt.sessionId === activeIdRef.current)
           flashToast(`session ended${evt.code != null ? ` (exit ${evt.code})` : ""} — click it again to resume`);
+        break;
+      case "vision-transcribing":
+        // The server is transcribing the attached images with a vision model
+        // because the active model can't take them. It's a multi-second round
+        // trip, so say so rather than leaving the composer looking stuck.
+        flashToast(`正在用 ${evt.model} 转写图片…`);
+        break;
+      case "vision-transcribed":
+        // Record it against the user message that carried the images (uid), so
+        // the transcript can show what the model actually received.
+        setVisionNotes((p) => ({
+          ...p,
+          [evt.sessionId]: {
+            ...(p[evt.sessionId] || {}),
+            [evt.uid || "?"]: { model: evt.model, text: evt.text, truncated: !!evt.truncated },
+          },
+        }));
+        break;
+      case "vision-unsupported":
+        // The gateway rejected an image block for a model we believed could
+        // take one. The bubble above already shows the raw 400; this adds the
+        // actionable half.
+        flashToast(
+          `${evt.model} 不支持图片输入。请切换到 ${describeModel || visionModels[0] || "一个视觉模型"}，或改用文字描述。`,
+        );
+        break;
+      case "payload-too-large":
+        // The gateway can't even READ the request body any more (16MB limit):
+        // the session's accumulated images/context are too large to ever be
+        // re-sent, so every message fails with "failed to read request body".
+        // The bubble above already shows the raw 400; this adds the way out.
+        flashToast(
+          "本会话累计的图片/内容已超过网关 16MB 请求上限，重试无用。请新开一个会话继续 — 旧会话的记录（含图片）仍可查看。",
+        );
+        break;
+      case "payload-near-limit":
+        // Proactive version: the session's transcript has crossed the budget
+        // but requests still fit — for now. Warn while there's still time to
+        // start a fresh session on the user's own terms.
+        flashToast(
+          "本会话累计内容已超过 12MB，正在接近网关 16MB 请求上限。建议尽快新开会话（旧会话记录仍可查看），避免之后所有消息报错。",
+        );
         break;
       case "error":
         console.error("server error", evt.message);
@@ -570,8 +702,28 @@ export default function App() {
     });
   }
 
-  function handleResult(sessionId) {
+  function handleResult(sessionId, data) {
     setBusyBy((p) => ({ ...p, [sessionId]: false }));
+    // The result event carries the turn's metrics (tokens for this turn,
+    // cumulative cost/duration/turns for the session). Capture them so the
+    // metrics bar updates the moment a turn finishes — the server also
+    // persists + broadcasts them, but applying here avoids waiting for the
+    // next `sessions` broadcast to see the fresh numbers.
+    if (data && typeof data === "object") {
+      const u = data.usage || {};
+      setMetricsBy((p) => ({
+        ...p,
+        [sessionId]: {
+          inputTokens: u.input_tokens || 0,
+          outputTokens: u.output_tokens || 0,
+          cacheReadTokens: u.cache_read_input_tokens || 0,
+          cacheCreationTokens: u.cache_creation_input_tokens || 0,
+          totalCostUsd: typeof data.total_cost_usd === "number" ? data.total_cost_usd : null,
+          totalDurationMs: typeof data.duration_ms === "number" ? data.duration_ms : null,
+          totalTurns: typeof data.num_turns === "number" ? data.num_turns : null,
+        },
+      }));
+    }
     setMsgs((prev) => {
       const arr = prev[sessionId] ? [...prev[sessionId]] : [];
       for (let i = arr.length - 1; i >= 0; i--) {
@@ -694,6 +846,9 @@ export default function App() {
       type: "send",
       sessionId: activeId,
       text,
+      // Echoed back on the vision-transcribing/vision-transcribed events so the
+      // transcription can be attached to this exact bubble.
+      uid,
       ...(attachments.length
         ? { attachments: attachments.map((a) => ({ mediaType: a.mediaType, data: a.data, name: a.name })) }
         : {}),
@@ -708,31 +863,15 @@ export default function App() {
 
   function sendMessage(text, attachments = []) {
     if (!activeId) return;
-    // Image input to a text-only model 400s at the gateway. If this message has
-    // image attachments, the active model isn't vision-capable, and a vision
-    // model is both configured and actually served (present in modelOptions),
-    // restart the session under the first vision model (model is fixed per
-    // spawned claude process, so switching needs a resume-restart) and hold the
-    // message until the new process is ready (delivered from the `history`
-    // handler). Non-image attachments are inlined as text by the backend, so
-    // they do NOT trigger a vision switch.
+    // Image input to a text-only model 400s at the gateway, so the SERVER
+    // transcribes the images with a vision model and forwards the text (see
+    // server/vision.js). The session keeps the model the user picked rather
+    // than being restarted onto a vision model. This is purely informational —
+    // say it's about to happen, then send normally. Non-image attachments are
+    // inlined as text by the backend and need no notice.
     const hasImage = attachments.some((a) => a.kind === "image");
-    const visionTarget = visionModels[0];
-    if (
-      hasImage &&
-      visionTarget &&
-      !isVisionModel(model) &&
-      modelOptions.includes(visionTarget)
-    ) {
-      // Bind the held send to the session we're restarting so the `history`
-      // flush only fires for THAT session — otherwise a stuck ref (restart
-      // failed / process exited) would misdeliver the images into whichever
-      // session the user next opens (subscribe always emits `history`).
-      pendingVisionSendRef.current = { text, attachments, sessionId: activeId };
-      flashToast(`Switching to ${visionTarget} for image input…`);
-      // No `confirm` field → server keeps the session's existing confirm mode.
-      send({ type: "start", sessionId: activeId, model: visionTarget });
-      return;
+    if (hasImage && !isVisionModel(model)) {
+      flashToast(`图片将先由 ${describeModel || "视觉模型"} 转写为文字，再交给 ${model}。`);
     }
     deliverSend(text, attachments);
   }
@@ -768,6 +907,11 @@ export default function App() {
     setCwdBy((p) => {
       if (p[id] === undefined) return p;
       const { [id]: _c, ...rest } = p;
+      return rest;
+    });
+    setMetricsBy((p) => {
+      if (p[id] === undefined) return p;
+      const { [id]: _m, ...rest } = p;
       return rest;
     });
     setActiveId((cur) => (cur === id ? null : cur));
@@ -859,6 +1003,7 @@ export default function App() {
   const activeMeta = activeId ? historyMetaBy[activeId] || null : null;
   const busy = activeId ? !!busyBy[activeId] : false;
   const activeCwd = activeId ? cwdBy[activeId] : selectedCwd;
+  const activeMetrics = activeId ? metricsBy[activeId] || null : null;
   // Sessions are scoped to the selected workspace (each session's cwd IS its
   // workspace). The full list is still held in `sessions` so switching back is
   // instant; we just filter what the sidebar shows. Mirror the live busyBy
@@ -910,6 +1055,7 @@ export default function App() {
       <Sidebar
         sessions={wsSessions}
         activeId={activeId}
+        metricsBy={metricsBy}
         onPick={pickSession}
         onNew={newChat}
         onRemove={removeSession}
@@ -996,7 +1142,12 @@ export default function App() {
             </div>
           )}
           {activeMsgs.map((m, i) => (
-            <Message key={m.id || m.uid || `u${i}`} msg={m} />
+            <Fragment key={m.id || m.uid || `u${i}`}>
+              <Message msg={m} />
+              {m.uid && visionNotes[activeId]?.[m.uid] && (
+                <VisionNote note={visionNotes[activeId][m.uid]} />
+              )}
+            </Fragment>
           ))}
           <div ref={messagesEndRef} />
         </div>
@@ -1008,6 +1159,8 @@ export default function App() {
             ))}
           </div>
         )}
+
+        {activeMetrics && <MetricsBar metrics={activeMetrics} />}
 
         <Composer onSend={sendMessage} onStop={stop} busy={busy} disabled={!activeId} />
           </>

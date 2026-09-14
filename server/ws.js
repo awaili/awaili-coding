@@ -124,8 +124,11 @@ async function handle(ws, msg) {
       // delivered to the model as image content blocks; anything else is read
       // by Session.send and inlined as a text block (text files) or a note
       // (binary), so non-image files work even on text-only models. Cap total
-      // payload so a huge paste can't blow up the WS frame / spawn stdin.
-      const MAX_ATTACH_BYTES = 20 * 1024 * 1024; // 20 MB of base64 chars
+      // payload so a huge paste can't blow up the WS frame / spawn stdin — and
+      // keep it under the gateway's 16MB request-body READ limit: whether the
+      // images are forwarded raw or sent for transcription, that request goes
+      // through the same gateway, which 400s beyond it.
+      const MAX_ATTACH_BYTES = 12 * 1024 * 1024; // 12 MB of base64 chars
       const attachments = [];
       let total = 0;
       if (Array.isArray(msg.attachments)) {
@@ -138,13 +141,17 @@ async function handle(ws, msg) {
           total += data.length;
           if (total > MAX_ATTACH_BYTES) {
             return ws.send(
-              JSON.stringify({ type: "error", message: "attachments exceed 20 MB total" }),
+              JSON.stringify({ type: "error", message: "attachments exceed 12 MB total" }),
             );
           }
           attachments.push({ mediaType, data, name: String(att.name || "") });
         }
       }
-      const ok = await SessionManager.send(msg.sessionId, text, attachments);
+      // `uid` is the client's key for the optimistic user message it just
+      // rendered. Echoed back on vision-transcribed/vision-transcribing so the
+      // transcription can be attached to that exact bubble. Opaque to us.
+      const uid = typeof msg.uid === "string" ? msg.uid.slice(0, 64) : undefined;
+      const ok = await SessionManager.send(msg.sessionId, text, attachments, uid);
       if (!ok) ws.send(JSON.stringify({ type: "error", message: "send failed" }));
       return;
     }

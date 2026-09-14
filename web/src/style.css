@@ -159,6 +159,13 @@ input, textarea { font-family: inherit; }
 .msg.user .bubble { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; }
 .msg.user .images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .msg.user .images img { max-width: 220px; max-height: 220px; border: 1px solid var(--border); border-radius: 8px; object-fit: contain; background: var(--bg); }
+/* Transcription of images that were sent to a text-only model. Sits under the
+   user message it belongs to (negative margin pulls it against the gap), and
+   collapsed by default since the text can be long. */
+.vision-note { max-width: 880px; width: 100%; margin: -8px auto 0; }
+.vision-note-head { padding: 3px 8px; background: transparent; border: 1px dashed var(--border); border-radius: 6px; color: var(--muted); font-size: 12px; font-family: inherit; cursor: pointer; }
+.vision-note-head:hover { color: var(--text); border-color: var(--accent); }
+.vision-note-body { margin: 6px 0 0; padding: 10px 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; color: var(--muted); font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; }
 .msg.assistant .bubble { padding: 2px 0; }
 .md p { margin: 8px 0; line-height: 1.55; }
 .md h1,.md h2,.md h3 { margin: 14px 0 6px; }
@@ -196,6 +203,17 @@ input, textarea { font-family: inherit; }
 
 /* Inline confirmation / AskUserQuestion prompts (control_request events). */
 .prompts { max-width: 880px; width: 100%; margin: 8px auto 0; display: flex; flex-direction: column; gap: 8px; }
+
+/* Per-turn + cumulative metrics bar shown above the composer for the active
+   session. Sits on the same 880px column as the composer/prompts. */
+.metrics-bar { max-width: 880px; width: 100%; margin: 0 auto 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11px; color: var(--muted); font-family: var(--mono); padding: 0 2px; }
+.metrics-bar .metrics-label { text-transform: uppercase; letter-spacing: .04em; opacity: .8; }
+.metrics-bar .metrics-pair { display: inline-flex; gap: 8px; align-items: center; color: var(--text); }
+.metrics-bar .metrics-sep { opacity: .4; }
+.metrics-bar .metrics-tok-in { color: var(--accent-2); }
+.metrics-bar .metrics-tok-out { color: #6c8; }
+.metrics-bar .metrics-tok-cache { color: var(--muted); }
+.session-item .meta.metrics { font-size: 10px; opacity: .85; }
 .prompt-card { border: 1px solid var(--accent); border-radius: 8px; background: var(--panel); overflow: hidden; box-shadow: 0 0 0 1px rgba(0,0,0,0) ; }
 .prompt-card.ask { border-color: #b584; }
 .prompt-head { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; background: var(--panel-2); }

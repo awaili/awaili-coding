@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 import { config } from "./config.js";
+import { getCatalog } from "./catalog.js";
 import { attachWebSocket } from "./ws.js";
 import { attachTerm } from "./term.js";
 import { internalToken } from "./internal-token.js";
@@ -24,7 +25,12 @@ const root = resolve(__dirname, "..");
 const isProd = process.env.NODE_ENV === "production";
 
 const app = express();
-app.use(express.json());
+// Match nginx's client_max_body_size (20m). Express's default body limit is
+// only 100kb, so without this, saving any file whose content pushes the JSON
+// body past ~100kb makes express.json() throw PayloadTooLargeError — and with
+// no JSON error handler below, Express emits its HTML error page, so the
+// frontend's `await res.json()` throws "Unexpected token '<', \"<!DOCTYPE ...\"".
+app.use(express.json({ limit: "20mb" }));
 
 // Trust proxy headers (X-Forwarded-Proto) so cookie `Secure` is set correctly
 // when served behind a TLS-terminating reverse proxy.
@@ -122,74 +128,26 @@ app.get("/api/health", (_req, res) =>
   }),
 );
 
-// Live model catalog from the Ollama gateway. Two sources are merged:
-//   1. GET /api/tags  — locally available (pulled) models.
-//   2. POST /api/show — verifies a *cloud* model resolves. Ollama does NOT list
-//      cloud models (e.g. glm-5.2:cloud) in /api/tags, so the only way to surface
-//      them is to probe each configured AVAILABLE_MODELS candidate and keep the
-//      ones that answer. The base is derived from ANTHROPIC_BASE_URL (the same
-//      host serves /v1/messages and /api/tags), overridable via OLLAMA_BASE_URL.
-// Falls back to the configured AVAILABLE_MODELS list if the gateway is
-// unreachable, so the dropdown is never empty.
-function ollamaBase() {
-  return (config.ollamaBaseUrl || config.anthropicBaseUrl).replace(/\/+$/, "");
-}
-
-async function fetchLocalModels(base) {
-  const res = await fetch(`${base}/api/tags`, { signal: AbortSignal.timeout(3000) });
-  if (!res.ok) throw new Error(`ollama /api/tags → ${res.status}`);
-  const j = await res.json();
-  return (j.models || []).map((m) => m.name).filter(Boolean);
-}
-
-// Cloud models aren't enumerated anywhere; verify each candidate via /api/show.
-async function fetchCloudModels(base, candidates) {
-  const out = [];
-  await Promise.all(
-    candidates.map(async (name) => {
-      if (!name) return;
-      try {
-        const res = await fetch(`${base}/api/show`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name }),
-          signal: AbortSignal.timeout(3000),
-        });
-        if (res.ok) out.push(name);
-      } catch {
-        /* candidate unreachable — skip */
-      }
-    }),
-  );
-  return out;
-}
-
-// Models the UI offers in its dropdown. Sourced live from Ollama (local tags +
-// probed cloud models) so the list reflects what the gateway actually serves;
-// the configured AVAILABLE_MODELS list is only the fallback. The configured
-// default model is always kept selectable even if Ollama omits it.
+// Models the UI offers in its dropdown, plus which of them accept images.
+// Discovery + capability detection live in catalog.js (which caches); the
+// configured AVAILABLE_MODELS list is only the fallback, and the configured
+// default model is always kept selectable even if the gateway omits it.
+// `describeModel` is the vision model the server transcribes images with when
+// the active model can't take them (see sessions.js / vision.js).
 app.get("/api/models", async (_req, res) => {
-  let models = config.availableModels;
-  let source = "config";
-  try {
-    const base = ollamaBase();
-    const [local, cloud] = await Promise.all([
-      fetchLocalModels(base),
-      fetchCloudModels(base, config.availableModels),
-    ]);
-    const discovered = [...new Set([...local, ...cloud])];
-    if (discovered.length) {
-      models = discovered;
-      source = "ollama";
-    }
-  } catch {
-    /* gateway unreachable — keep the configured list */
-  }
+  const { models: discovered, visionModels, source } = await getCatalog();
+  let models = discovered;
   const has = new Set(models);
   if (config.anthropicModel && !has.has(config.anthropicModel)) {
     models = [config.anthropicModel, ...models];
   }
-  res.json({ default: config.anthropicModel, models, source });
+  res.json({
+    default: config.anthropicModel,
+    models,
+    visionModels,
+    describeModel: config.visionDescribeModel,
+    source,
+  });
 });
 
 if (isProd) {
@@ -205,6 +163,20 @@ if (isProd) {
     );
   }
 }
+
+// Last-resort error handler. Without this, a thrown error (e.g. express.json
+// rejecting an oversized body) falls through to Express's default HTML error
+// page, which starts with <!DOCTYPE html> and makes the frontend's
+// `res.json()` throw a confusing "Unexpected token '<'" instead of surfacing
+// the real problem. Always reply with JSON for /api routes.
+app.use((err, req, res, _next) => {
+  if (req.path.startsWith("/api")) {
+    const status = err.status || 500;
+    res.status(status).json({ error: err.message || `HTTP ${status}` });
+    return;
+  }
+  res.status(err.status || 500).type("text/plain").send(err.message || "Internal Server Error");
+});
 
 const server = app.listen(config.port, config.host, () => {
   // eslint-disable-next-line no-console
