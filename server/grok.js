@@ -17,6 +17,7 @@ import { appendFileSync, writeFileSync, rmSync, readFileSync, mkdirSync } from "
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { sessionLogPath, fileToTextBlock } from "./util.js";
+import { safeProcessEnv } from "./config.js";
 
 // sessions.js assigns this at module load (same pattern as codexHooks — the
 // state broadcast + persistence live there; a mutable object dodges the
@@ -241,7 +242,7 @@ export class GrokSession extends EventEmitter {
       const tr = {
         type: "tool_result",
         tool_use_id: evt.toolCallId,
-        content: toolResultText(evt) + (mediaRel ? `\n[生成文件已复制到工作区: ${mediaRel}]` : ""),
+        content: toolResultText(evt) + (mediaRel ? `\n[generated file copied into the workspace: ${mediaRel}]` : ""),
         is_error: evt.status === "failed",
       };
       if (mediaRel) {
@@ -315,6 +316,17 @@ export class GrokSession extends EventEmitter {
         totalDurationMs: result.duration_ms,
         totalTurns: this.turnCount,
       };
+      // Usage sidecar so this turn shows up in the Usage panel's local ledger
+      // (server/usage.js scans transcripts; grok's assistant records carry no
+      // usage of their own). loadHistory ignores unknown record types.
+      this.appendTranscript({
+        type: "usage",
+        uuid: randomUUID(),
+        engine: "grok",
+        model: this.model,
+        timestamp: new Date().toISOString(),
+        usage: result.usage,
+      });
       this.emit("event", { type: "claude", data: result, sessionId: this.id });
       if (failed) {
         this.emit("event", { type: "error", sessionId: this.id, message: "grok turn ended with an error" });
@@ -385,7 +397,7 @@ export class GrokSession extends EventEmitter {
         mkdirSync(this.tmpDir, { recursive: true });
         const f = join(this.tmpDir, name || `img-${attLines.length}.png`);
         writeFileSync(f, Buffer.from(att.data, "base64"));
-        attLines.push(`用户上传了图片 ${f}，请用工具读取查看。`);
+        attLines.push(`The user attached an image, ${f} — read it with a tool to view it.`);
         continue;
       }
       const block = fileToTextBlock(att.data, mediaType, name);
@@ -399,7 +411,7 @@ export class GrokSession extends EventEmitter {
       mkdirSync(this.tmpDir, { recursive: true });
       const f = join(this.tmpDir, name || `att-${attLines.length}.bin`);
       writeFileSync(f, Buffer.from(att.data, "base64"));
-      attLines.push(`附件已保存为 ${f}（${mediaType || "binary"}），可用工具读取。`);
+      attLines.push(`Attachment saved as ${f} (${mediaType || "binary"}) — readable with a tool.`);
     }
     const userText = [...content.filter((b) => b.type === "text").map((b) => b.text), ...attLines]
       .join("\n")
@@ -439,7 +451,9 @@ export class GrokSession extends EventEmitter {
 
     let proc;
     try {
-      proc = spawn("grok", args, { cwd: this.cwd, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] });
+      // safeProcessEnv() (not process.env) so the web UI's own AUTH_PASSWORD /
+      // AUTH_SECRET never reach the CLI — see config.js SECRET_ENV_KEYS.
+      proc = spawn("grok", args, { cwd: this.cwd, env: safeProcessEnv(), stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       this.busy = false;
       this.emit("event", { type: "error", sessionId: this.id, message: `failed to start grok: ${e.message}` });

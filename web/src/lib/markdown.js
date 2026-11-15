@@ -1,5 +1,4 @@
 import { marked } from "marked";
-import hljs from "highlight.js";
 import DOMPurify from "dompurify";
 import markedKatex from "marked-katex-extension";
 // KaTeX's stylesheet (fonts + layout). Vite bundles the CSS and the woff/ttf
@@ -61,9 +60,26 @@ export function renderMarkdown(text) {
   });
 }
 
+// highlight.js with every language registered is 311 KB gzipped — the single
+// biggest thing in the bundle, and it is only ever needed AFTER a render that
+// actually produced a code block. So it is loaded on demand rather than
+// statically: the app shell, the login screen and any code-free conversation
+// never fetch it, and when it is fetched it no longer blocks first paint.
+let hljsPromise = null;
+function loadHljs() {
+  hljsPromise ||= import("highlight.js").then((m) => m.default);
+  return hljsPromise;
+}
+
 // Highlight all <pre><code> blocks inside a container after render.
-export function highlightAll(container) {
+export async function highlightAll(container) {
   if (!container) return;
+  // Cheap pre-check so a message without code never triggers the download.
+  if (!container.querySelector("pre code:not([data-hl])")) return;
+  const hljs = await loadHljs();
+  // Re-query after the await: the container's innerHTML may have been replaced
+  // while the chunk was in flight (a streaming message re-renders constantly),
+  // and the nodes captured before it would be detached.
   for (const block of container.querySelectorAll("pre code")) {
     if (block.dataset.hl) continue;
     try {

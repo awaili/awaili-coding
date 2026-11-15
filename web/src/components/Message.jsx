@@ -1,3 +1,4 @@
+import { memo } from "react";
 import Markdown from "./Markdown.jsx";
 import ToolCard from "./ToolCard.jsx";
 
@@ -16,7 +17,7 @@ function fmtSize(n) {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-export default function Message({ msg }) {
+function Message({ msg }) {
   if (msg.role === "user") {
     const images = Array.isArray(msg.images) ? msg.images : [];
     const files = Array.isArray(msg.files) ? msg.files : [];
@@ -70,3 +71,9 @@ export default function Message({ msg }) {
     </div>
   );
 }
+
+// The transcript re-renders on every streamed token (App's message state gets a
+// new identity per delta), but only the LAST assistant message actually changes.
+// App updates message objects immutably, so a shallow prop compare is enough to
+// keep every earlier bubble — and its markdown/KaTeX/highlight work — untouched.
+export default memo(Message);

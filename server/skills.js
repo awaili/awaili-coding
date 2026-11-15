@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { confineCwd, safe, mkdirp } from "./util.js";
+import { safeProcessEnv } from "./config.js";
 
 const execFileP = promisify(execFile);
 
@@ -435,7 +436,10 @@ async function runGit(args, cwd, timeoutMs) {
       cwd: cwd || undefined,
       timeout: timeoutMs,
       maxBuffer: 1 << 20,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      // safeProcessEnv(), not process.env: this reaches out to the network, so
+      // the UI's own secrets have no business being in its environment (see
+      // config.js SECRET_ENV_KEYS).
+      env: { ...safeProcessEnv(), GIT_TERMINAL_PROMPT: "0" },
     });
     return (stderr || "").toString().trim();
   } catch (e) {
@@ -739,6 +743,7 @@ router.post(
         await execFileP("unzip", ["-qq", "-o", zipPath, "-d", extractDir], {
           timeout: 30000,
           maxBuffer: 1 << 20,
+          env: safeProcessEnv(), // see config.js SECRET_ENV_KEYS
         });
       } catch (e) {
         const m = (e.message || "").toString();

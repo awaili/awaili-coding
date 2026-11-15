@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import DiffView from "./DiffView.jsx";
 
 function summarize(name, input) {
@@ -76,7 +76,7 @@ function ToolResult({ result, isError }) {
   );
 }
 
-export default function ToolCard({ block }) {
+function ToolCard({ block }) {
   const [open, setOpen] = useState(false);
   const { name, input, result, isError, pending } = block;
   const hasResult = result !== undefined;
@@ -98,3 +98,8 @@ export default function ToolCard({ block }) {
     </div>
   );
 }
+
+// Blocks are replaced immutably one index at a time while a turn streams, so a
+// shallow compare keeps already-finished tool cards (and their diffs / result
+// bodies) from re-rendering on every token of the message they live in.
+export default memo(ToolCard);

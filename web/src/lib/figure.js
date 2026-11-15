@@ -6,11 +6,27 @@
 // `highlightAll` highlights code) by scanning the live DOM for
 // <pre><code class="language-jsxgraph"> and swapping each <pre> for a board.
 //
+// jsxgraph is 245 KB gzipped — a quarter of the whole bundle — and only a
+// handful of messages ever contain a ```jsxgraph fence. So it is NOT imported
+// statically: loadJXG() pulls it (and its stylesheet) on demand the first time
+// a board actually has to be mounted, and Vite emits it as its own chunk that
+// most sessions never fetch.
+//
 // jsxgraph's package.json "exports" only exposes src/index.js, so a bare
 // subpath like "jsxgraph/distrib/jsxgraph.css" fails under Vite's
 // exports-aware resolver; import the stylesheet by relative path instead.
-import JXG from "jsxgraph";
-import "../../../node_modules/jsxgraph/distrib/jsxgraph.css";
+let jxgPromise = null;
+let JXG = null; // set once loaded, so freeBoards() can run synchronously
+function loadJXG() {
+  jxgPromise ||= Promise.all([
+    import("jsxgraph"),
+    import("../../../node_modules/jsxgraph/distrib/jsxgraph.css"),
+  ]).then(([mod]) => {
+    JXG = mod.default;
+    return JXG;
+  });
+  return jxgPromise;
+}
 
 // Spec elements that plot a function carry an expression string ("f": "x+1")
 // which we compile with the Function constructor. The .md content is trusted
@@ -62,12 +78,16 @@ function createEl(board, el) {
 }
 
 // Scan `container` for jsxgraph code fences and mount a board in place of each.
-// Returns the list of created boards so the caller can freeBoards() them on
+// Resolves to the list of created boards so the caller can freeBoards() them on
 // cleanup (React re-renders replace innerHTML, so old boards must be released
-// to avoid leaks / duplicate intervals).
-export function mountBoards(container) {
+// to avoid leaks / duplicate intervals). Async because the library itself is
+// fetched on demand — it resolves to [] immediately when there is no board to
+// mount, which is the overwhelmingly common case and costs no download.
+export async function mountBoards(container) {
   if (!container) return [];
   const codes = container.querySelectorAll("pre > code.language-jsxgraph");
+  if (!codes.length) return [];
+  await loadJXG();
   const boards = [];
   codes.forEach((code) => {
     const pre = code.parentElement;
@@ -75,7 +95,7 @@ export function mountBoards(container) {
     try {
       spec = JSON.parse(code.textContent);
     } catch (e) {
-      pre.replaceWith(errNode("jsxgraph: JSON 解析失败 — " + e.message));
+      pre.replaceWith(errNode("jsxgraph: could not parse JSON — " + e.message));
       return;
     }
     const id = "jxg-" + (++seq);
@@ -106,6 +126,7 @@ export function mountBoards(container) {
 }
 
 export function freeBoards(boards) {
+  if (!JXG) return; // nothing was ever mounted, so nothing to free
   (boards || []).forEach((b) => {
     try {
       JXG.JSXGraph.freeBoard(b);

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 import { config, childEnv, routeForModel } from "./config.js";
@@ -8,7 +9,8 @@ import { buildClaudeArgs } from "./claude-args.js";
 import { availableSkillsForCwd, pickSkill } from "./skills.js";
 import { isVisionModel } from "./catalog.js";
 import { transcribeImages } from "./vision.js";
-import { sessionLogPath, fileToTextBlock } from "./util.js";
+import { sessionLogPath, fileToTextBlock, injectSkill, transcriptEngine } from "./util.js";
+import { readHistory, embeddedImageBytes, forgetTranscript } from "./transcript.js";
 import { CodexSession, codexHooks } from "./codex.js";
 import { GrokSession, grokHooks } from "./grok.js";
 
@@ -53,198 +55,10 @@ function sessionClassFor(model) {
 // the same shape. We read it to show prior conversation when a session is
 // resumed (--resume does NOT replay history in stream-json print mode).
 
-// Total base64 bytes of image blocks embedded in a session's transcript —
-// both pasted images (user content blocks) and tool results (e.g. a browser
-// driver whose screenshots get Read back as image blocks; that flow produced a
-// 41MB transcript whose every turn then 400s at the gateway). Every turn
-// re-sends the whole history, and the gateway refuses to READ request bodies
-// at 16MB (see config.imageBudgetBytes), so send() uses this to decide whether
-// embedding yet another image would push the session past what can ever be
-// transported again. Cached on (size, mtime) so a send doesn't rescan a 40MB
-// transcript on every message; a miss rescans once.
-const imageBytesCache = new Map();
-function embeddedImageBytes(cwd, sessionId) {
-  const path = sessionLogPath(cwd, sessionId);
-  if (!path) return 0;
-  let st;
-  try {
-    st = statSync(path);
-  } catch {
-    return 0;
-  }
-  const cached = imageBytesCache.get(path);
-  if (cached && cached.size === st.size && cached.mtime === st.mtimeMs) return cached.bytes;
-  let bytes = 0;
-  try {
-    for (const line of readFileSync(path, "utf8").split("\n")) {
-      if (!line.includes('"image"')) continue; // fast skip of non-image records
-      let r;
-      try {
-        r = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (r.isSidechain || r.type !== "user") continue;
-      const countBlocks = (blocks) => {
-        for (const b of blocks || []) {
-          if (!b || typeof b !== "object") continue;
-          if (b.type === "image" && b.source?.type === "base64" && typeof b.source.data === "string") {
-            bytes += b.source.data.length;
-          } else if (b.type === "tool_result" && Array.isArray(b.content)) {
-            countBlocks(b.content); // tool results can carry image blocks too
-          }
-        }
-      };
-      countBlocks(Array.isArray(r.message?.content) ? r.message.content : []);
-    }
-  } catch {
-    // unreadable transcript: treat as 0 — worst case we embed and let the
-    // gateway's own (detected) error surface.
-  }
-  imageBytesCache.set(path, { size: st.size, mtime: st.mtimeMs, bytes });
-  return bytes;
-}
-
-// Build a message list in the shape the web frontend already uses internally
-// ({role:"user",text} and {role:"assistant",id,blocks,streaming}), matching
-// tool_result records back onto their tool_use blocks so tool cards render
-// with results. Non-user/assistant records (queue ops, attachments, system,
-// ai-title, sidechain) are skipped.
-//
-// `opts` enables pagination so we don't ship the whole transcript at once:
-//   - { limit }                       → return the last `limit` messages (tail)
-//   - { limit, beforeIndex }          → return up to `limit` messages ending
-//                                       just before `beforeIndex` (older page)
-// Both forms return { messages, oldestIndex, hasMore }, where `oldestIndex` is
-// the front-indexed position of the oldest returned message (stable across
-// appends, so the client can use it as the cursor for the next older page).
-// Without `opts` the full chronological array is returned (backward compat).
-function loadHistory(cwd, sessionId, opts) {
-  let raw;
-  try {
-    raw = readFileSync(sessionLogPath(cwd, sessionId), "utf8");
-  } catch {
-    return opts ? { messages: [], oldestIndex: 0, hasMore: false } : [];
-  }
-  const messages = [];
-  for (const line of raw.split("\n")) {
-    const text = line.trim();
-    if (!text) continue;
-    let r;
-    try {
-      r = JSON.parse(text);
-    } catch {
-      continue;
-    }
-    if (r.isSidechain) continue;
-    const content = r.message?.content;
-    if (r.type === "user") {
-      const blocks = Array.isArray(content) ? content : [];
-      const hasToolResult = blocks.some((b) => b && b.type === "tool_result");
-      if (hasToolResult) {
-        for (const tr of blocks) {
-          if (!tr || tr.type !== "tool_result") continue;
-          for (let i = messages.length - 1; i >= 0; i--) {
-            const m = messages[i];
-            if (m.role !== "assistant") continue;
-            const bi = m.blocks.findIndex((b) => b.type === "tool_use" && b.id === tr.tool_use_id);
-            if (bi >= 0) {
-              m.blocks[bi] = { ...m.blocks[bi], result: tr.content, isError: !!tr.is_error, pending: false };
-              break;
-            }
-          }
-        }
-      } else {
-        const userText = stripSkillInjection(
-          blocks
-            .filter((b) => b && b.type === "text")
-            .map((b) => b.text || "")
-            .join(""),
-        );
-        // Reference image blocks by URL (served lazily by GET /api/transcript/image)
-        // rather than embedding base64 — keeps the history WS payload + DOM small.
-        const images = [];
-        blocks.forEach((b, i) => {
-          if (b && b.type === "image" && b.source) {
-            images.push({
-              mediaType: b.source.media_type || "image/png",
-              url: `/api/transcript/image?cwd=${encodeURIComponent(cwd)}&session=${encodeURIComponent(sessionId)}&uuid=${encodeURIComponent(r.uuid)}&idx=${i}`,
-            });
-          }
-        });
-        if (userText) {
-          const m = { role: "user", text: userText };
-          if (images.length) m.images = images;
-          messages.push(m);
-        } else if (images.length) {
-          messages.push({ role: "user", text: "", images });
-        } else if (typeof content === "string" && content) {
-          messages.push({ role: "user", text: stripSkillInjection(content) });
-        }
-      }
-    } else if (r.type === "assistant") {
-      const msg = r.message || {};
-      const blocks = (Array.isArray(msg.content) ? msg.content : []).map((c) => {
-        if (c.type === "text") return { type: "text", text: c.text || "" };
-        if (c.type === "tool_use")
-          return { type: "tool_use", id: c.id, name: c.name, input: c.input, pending: true };
-        if (c.type === "thinking") return { type: "thinking", thinking: c.thinking || "" };
-        return { type: "other", raw: c };
-      });
-      messages.push({ role: "assistant", id: msg.id || r.uuid, blocks, streaming: false });
-    }
-  }
-  // No opts → full chronological array (backward compat).
-  if (!opts) return messages;
-  // Paginated: slice a tail (no beforeIndex) or an older page ending before
-  // beforeIndex. `oldestIndex` is the front-indexed start of the returned
-  // slice — stable under appends, so the client uses it as the next cursor.
-  const limit = opts.limit > 0 ? opts.limit : messages.length;
-  let start;
-  if (opts.beforeIndex != null && Number.isFinite(opts.beforeIndex)) {
-    const end = Math.min(opts.beforeIndex, messages.length);
-    start = Math.max(0, end - limit);
-    return { messages: messages.slice(start, end), oldestIndex: start, hasMore: start > 0 };
-  }
-  start = Math.max(0, messages.length - limit);
-  return { messages: messages.slice(start), oldestIndex: start, hasMore: start > 0 };
-}
-
-// Serve a single image block from a session transcript as decoded bytes. Used by
-// GET /api/transcript/image so resumed conversations can <img> past images
-// without embedding multi-hundred-KB base64 in the history WS payload.
-export function readTranscriptImage(cwd, sessionId, uuid, idx) {
-  let raw;
-  try {
-    raw = readFileSync(sessionLogPath(cwd, sessionId), "utf8");
-  } catch {
-    return null;
-  }
-  for (const line of raw.split("\n")) {
-    const t = line.trim();
-    if (!t) continue;
-    let r;
-    try {
-      r = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    if (r.uuid !== uuid) continue;
-    const content = r.message?.content;
-    if (!Array.isArray(content)) return null;
-    const block = content[idx];
-    if (!block || block.type !== "image" || !block.source || !block.source.data) return null;
-    try {
-      return {
-        mediaType: block.source.media_type || "image/png",
-        buffer: Buffer.from(block.source.data, "base64"),
-      };
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
+// Transcript reading (history pagination, per-image fetch, and the embedded
+// image budget) lives in transcript.js, which streams the JSONL instead of
+// doing readFileSync + full-file JSON.parse on the event loop. See that
+// module's header for the measured stall this removed.
 
 function loadState() {
   try {
@@ -256,11 +70,18 @@ function loadState() {
         // follow-up send fails with "send failed" — prune them so the sidebar
         // only shows sessions that can actually be resumed.
         if (!existsSync(sessionLogPath(s.cwd, s.id) || "")) continue;
-        // Restore as real Session instances (not plain objects) so the methods
+        // Restore as real session instances (not plain objects) so the methods
         // used on resume — stop(), send() — exist. proc stays null: these are
         // not running, so stop() is a no-op until the session is re-picked and
-        // SessionManager.start() spawns a fresh claude process for it.
-        const sess = new Session({ id: s.id, cwd: s.cwd, resume: s.id, model: s.model, confirm: s.confirm });
+        // SessionManager.start() spawns a fresh process for it.
+        //
+        // Pick the class by the session's OWN model, exactly like start()
+        // does. Hardcoding the claude Session here (as this did) silently
+        // changed a codex/grok chat's engine on every server restart, and the
+        // claude CLI cannot drive an adapter-written transcript — so reopening
+        // such a chat after a restart died with "No conversation found with
+        // session ID: <id>".
+        const sess = new (sessionClassFor(s.model))({ id: s.id, cwd: s.cwd, resume: s.id, model: s.model, confirm: s.confirm });
         sess.title = s.title;
         sess.createdAt = s.createdAt;
         sess.metrics = s.metrics || null;
@@ -413,7 +234,29 @@ class Session extends EventEmitter {
     // to reopen. The transcript is the source of truth: if it's there, this
     // session has history and must be resumed, never restarted fresh.
     const logPath = sessionLogPath(this.cwd, this.id);
-    this.resume = logPath && existsSync(logPath) ? this.id : undefined;
+    const hasLog = !!(logPath && existsSync(logPath));
+    // ...but only the claude CLI's own transcripts are resumable by it. A chat
+    // whose history was written by the codex/grok adapter can be driven by
+    // neither flag — `--resume` exits with "No conversation found with session
+    // ID", `--session-id` is refused as above — so refuse here with a message
+    // that names the way out, instead of spawning a process that dies on a
+    // line the user can't act on. (Reached when a chat's model is switched
+    // across engines, or when such a session is restored after a restart.)
+    const owner = hasLog ? transcriptEngine(logPath) : null;
+    if (owner && owner !== "claude") {
+      const back = owner === "codex" ? "gpt-5.6-*" : "grok-*";
+      this.ended = true;
+      this.busy = false;
+      this.emit("event", {
+        type: "error",
+        sessionId: this.id,
+        message:
+          `This chat was created with the ${owner} engine and the claude CLI cannot resume its history. ` +
+          `Switch the model back to a ${back} model to continue it, or start a new chat under ${this.model}.`,
+      });
+      return this.id;
+    }
+    this.resume = hasLog ? this.id : undefined;
     const args = buildClaudeArgs({ cwd: this.cwd, resume: this.resume, id: this.id, confirm: this.confirm });
     let proc;
     try {
@@ -609,7 +452,7 @@ class Session extends EventEmitter {
     // covers sources the server can't intercept.)
     try {
       const log = sessionLogPath(this.cwd, this.id);
-      if (log && !this.limitWarned && statSync(log).size > config.imageBudgetBytes) {
+      if (log && !this.limitWarned && (await stat(log)).size > config.imageBudgetBytes) {
         this.limitWarned = true;
         this.emit("event", { type: "payload-near-limit", sessionId: this.id });
       }
@@ -665,7 +508,7 @@ class Session extends EventEmitter {
         // would cross the budget, transcribe instead of embed: the session
         // keeps working, the model just receives later screenshots as words.
         const incoming = images.reduce((n, a) => n + a.data.length, 0);
-        if (embeddedImageBytes(this.cwd, this.id) + incoming > config.imageBudgetBytes) {
+        if ((await embeddedImageBytes(this.cwd, this.id)) + incoming > config.imageBudgetBytes) {
           visionOk = false;
           overBudget = true;
         }
@@ -687,11 +530,11 @@ class Session extends EventEmitter {
         try {
           const r = await transcribeImages(images, { model: describeModel });
           const note = overBudget
-            ? `会话累计图片体积已接近网关请求上限，改用转写以防请求体被拒`
+            ? "session image bytes are near the gateway request limit, transcribing instead so the body is not rejected"
             : "";
           content.push({
             type: "text",
-            text: `[图片转写 · ${r.model}${note ? ` · ${note}` : ""}]\n${r.text}`,
+            text: `[image transcript · ${r.model}${note ? ` · ${note}` : ""}]\n${r.text}`,
           });
           this.emit("event", {
             type: "vision-transcribed",
@@ -707,10 +550,10 @@ class Session extends EventEmitter {
           this.busy = false;
           emitStatus();
           const why = overBudget
-            ? `会话累计图片体积已达网关请求上限，需转写但转写失败了（${err.message}）。` +
-              `请新开会话，或改用文字描述。`
-            : `当前模型 ${this.model} 不支持图片，自动转写也失败了（${err.message}）。` +
-              `请切换到 ${describeModel} 或改用文字描述。`;
+            ? `This session's images hit the gateway request limit, and transcribing them failed (${err.message}). ` +
+              "Start a new session, or describe the image in text."
+            : `${this.model} does not accept images and automatic transcription failed (${err.message}). ` +
+              `Switch to ${describeModel}, or describe the image in text.`;
           this.emit("event", { type: "error", sessionId: this.id, message: why });
           return false;
         }
@@ -808,32 +651,9 @@ class Session extends EventEmitter {
   }
 }
 
-// Prepend a matched skill's instructions to the user's message so the model
-// follows the skill even when it wouldn't auto-invoke. The block is clearly
-// labeled (so it's visible in the transcript and the model treats it as
-// guidance), then the user's original request follows verbatim.
-function injectSkill(skill, text) {
-  const body = (skill.body || "").trim();
-  const scope = skill.scope === "workspace" ? " (this workspace)" : " (global)";
-  const header =
-    `[Active skill: ${skill.name}${scope} — this request matched it. ` +
-    `Apply the skill's instructions below, then fulfill the user's request.]`;
-  return `${header}\n\n${body}\n\n---\n\nUser request:\n${text}`;
-}
-
-// The live chat renders the user's ORIGINAL message (optimistic, before the
-// server injects a skill). On resume, though, history is read from the
-// transcript — which holds the injected block. Strip the wrapper so a resumed
-// session shows the same clean message the user typed, not the skill preamble.
-// Only touches text that genuinely starts with our injection marker and has the
-// `User request:` separator, so normal messages are passed through untouched.
-const SKILL_INJECT_SEP = "\n---\n\nUser request:\n";
-function stripSkillInjection(text) {
-  if (typeof text !== "string" || !text.startsWith("[Active skill:")) return text;
-  const i = text.indexOf(SKILL_INJECT_SEP);
-  if (i < 0) return text;
-  return text.slice(i + SKILL_INJECT_SEP.length);
-}
+// injectSkill() (send path) and stripSkillInjection() (history path, used by
+// transcript.js) both live in util.js now — the marker they wrap/unwrap has to
+// agree exactly, so it has one definition.
 
 // Turn a non-image base64 attachment into an Anthropic text content block. If
 // the decoded bytes look textual (no NUL bytes in the first 8 KB), inline the
@@ -894,16 +714,35 @@ export const SessionManager = {
     mkdirSync(cwd, { recursive: true });
     if (sessionId && sessions.has(sessionId)) {
       const s = sessions.get(sessionId);
-      // Stop the prior process before replacing it. Without this, re-picking a
-      // running session (or switching its model) would overwrite the map entry
-      // and orphan the old claude subprocess.
-      s.stop();
       // A passed model switches the session's model (restart-with-resume under
       // the new model); otherwise keep the model it was already using. Same for
       // confirm: an explicit boolean toggles interactive confirmation mode
       // (restarting under it); undefined keeps whatever the session had.
       const nextModel = model || s.model;
       const nextConfirm = confirm === undefined ? s.confirm : !!confirm;
+      // Switching a codex/grok chat onto a claude-engine model would strand
+      // it: the claude CLI can resume neither an adapter-written transcript
+      // nor an id whose file already exists (see util.js transcriptEngine).
+      // Refuse the switch while the session is still intact — stopping it
+      // first and failing at spawn time left the chat unusable until the user
+      // guessed to switch back. The unchanged model goes back to the client in
+      // ws.js's `session` reply, so the dropdown snaps back by itself.
+      const logPath = sessionLogPath(s.cwd, sessionId);
+      const owner = logPath && existsSync(logPath) ? transcriptEngine(logPath) : null;
+      if (sessionClassFor(nextModel) === Session && owner && owner !== "claude") {
+        s.emit("event", {
+          type: "error",
+          sessionId,
+          message:
+            `This chat runs on the ${owner} engine, and ${nextModel} would hand its history to the claude CLI, ` +
+            `which cannot resume it. Keeping ${s.model}. Start a new chat to use ${nextModel}.`,
+        });
+        return sessionId;
+      }
+      // Stop the prior process before replacing it. Without this, re-picking a
+      // running session (or switching its model) would overwrite the map entry
+      // and orphan the old claude subprocess.
+      s.stop();
       const resume = existsSync(sessionLogPath(s.cwd, sessionId) || "") ? sessionId : undefined;
       const sess = new (sessionClassFor(nextModel))({ id: sessionId, cwd: s.cwd, resume, model: nextModel, confirm: nextConfirm });
       // The restart replaces the map entry with a fresh Session object, so
@@ -989,6 +828,8 @@ export const SessionManager = {
         /* transcript already gone — fine */
       }
     }
+    // Drop the transcript's cached image index/budget with it.
+    forgetTranscript(s.cwd, sessionId);
     emitStatus();
     return true;
   },
@@ -1012,13 +853,13 @@ export const SessionManager = {
   },
 
   // Prior transcript for a session, in the frontend's message shape (empty if
-  // the JSONL log doesn't exist yet, e.g. a brand-new session). With `opts`
-  // ({limit[, beforeIndex]}) returns a paginated {messages, oldestIndex,
-  // hasMore}; without `opts` returns the full array (backward compat).
-  history(sessionId, opts) {
+  // the JSONL log doesn't exist yet, e.g. a brand-new session). `opts` is
+  // {limit[, beforeIndex]} and the result is a page: {messages, oldestIndex,
+  // hasMore}. Async — the transcript is streamed, not slurped (transcript.js).
+  async history(sessionId, opts) {
     const s = sessions.get(sessionId);
-    if (!s) return opts ? { messages: [], oldestIndex: 0, hasMore: false } : [];
-    return loadHistory(s.cwd, sessionId, opts);
+    if (!s) return { messages: [], oldestIndex: 0, hasMore: false };
+    return readHistory(s.cwd, sessionId, opts);
   },
 };
 

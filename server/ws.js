@@ -8,12 +8,15 @@ import { confineCwd } from "./util.js";
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
- * @type {Map<string, {ws: WebSocket, fn: (evt:any)=>void, sess: object}>}
- * keyed by the sessionId the listener was attached under. We store the Session
- * reference (not just the id) so detaching works even after a rename rewrites
- * the SessionManager's map key — without this the old id no longer resolves and
- * `.off` becomes a no-op, leaving a stale listener that double-delivers every
- * event on the next subscribe.
+ * @type {Map<WebSocket, {fn: (evt:any)=>void, sess: object}>}
+ * Each connection has at most one attached session listener, so the CONNECTION
+ * is the key. It used to be keyed by sessionId, which broke as soon as two
+ * clients watched the same chat (phone + desktop, or two tabs): the second
+ * subscribe overwrote the first's entry, so when the first connection closed
+ * the cleanup loop couldn't find it and its listener stayed attached to the
+ * Session forever — one leaked listener per switch, and EventEmitter starts
+ * warning at eleven. Keying by ws also means a session rename needs no
+ * bookkeeping here at all (the Session reference is what we detach from).
  */
 const listeners = new Map();
 
@@ -21,7 +24,12 @@ const listeners = new Map();
 // /ws and /term to their respective WSS instances (two {server,path} WSS would
 // each abort the other's path with a 400 handshake).
 export function attachWebSocket(server) {
-  const wss = new WebSocketServer({ noServer: true });
+  // Cap the frame size. `ws` defaults to 100MB, which it buffers and we then
+  // JSON.parse — so an authed client could spike several hundred MB of heap on
+  // a 3.6GB box before the 12MB attachment check downstream ever ran. 16MB
+  // leaves room for the largest legal `send` (12MB of base64 attachments plus
+  // text and JSON framing) and rejects anything beyond it at the protocol level.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
   const clients = new Set();
 
   // Broadcast the session list to every connected client whenever a session's
@@ -60,12 +68,7 @@ export function attachWebSocket(server) {
     ws.on("close", () => {
       clients.delete(ws);
       // drop this connection's listener but keep the subprocess alive for resume
-      for (const [id, entry] of listeners) {
-        if (entry.ws === ws) {
-          entry.sess.off("event", entry.fn);
-          listeners.delete(id);
-        }
-      }
+      detach(ws);
     });
   });
   return wss;
@@ -101,7 +104,7 @@ async function handle(ws, msg) {
       // Ship only the recent tail (paginated) to keep the WS payload + DOM
       // small for long sessions; older messages load via `historyMore`.
       if (msg.sessionId) {
-        const h = SessionManager.history(id, { limit: config.historyInitialSize });
+        const h = await SessionManager.history(id, { limit: config.historyInitialSize });
         ws.send(
           JSON.stringify({
             type: "history",
@@ -223,7 +226,7 @@ async function handle(ws, msg) {
           busy: !!sess.busy,
         }),
       );
-      const h = SessionManager.history(msg.sessionId, { limit: config.historyInitialSize });
+      const h = await SessionManager.history(msg.sessionId, { limit: config.historyInitialSize });
       ws.send(
         JSON.stringify({
           type: "history",
@@ -246,7 +249,7 @@ async function handle(ws, msg) {
       const beforeIndex = Number(msg.beforeIndex);
       if (!Number.isFinite(beforeIndex) || beforeIndex < 0)
         return ws.send(JSON.stringify({ type: "error", message: "invalid beforeIndex" }));
-      const h = SessionManager.history(msg.sessionId, {
+      const h = await SessionManager.history(msg.sessionId, {
         limit: config.historyPageSize,
         beforeIndex,
       });
@@ -267,47 +270,38 @@ async function handle(ws, msg) {
   }
 }
 
+// Detach whatever session listener this connection currently holds. Safe to
+// call when it holds none.
+function detach(ws) {
+  const entry = listeners.get(ws);
+  if (!entry) return;
+  entry.sess.off("event", entry.fn);
+  listeners.delete(ws);
+}
+
 function subscribe(ws, sessionId) {
-  // remove old listener for this ws if any (detach from the actual Session
-  // instance, which may have been re-keyed by a rename since we subscribed).
-  for (const [id, entry] of listeners) {
-    if (entry.ws === ws) {
-      entry.sess.off("event", entry.fn);
-      listeners.delete(id);
-    }
-  }
+  detach(ws); // one session per connection
   const sess = SessionManager.get(sessionId);
   if (!sess) return;
-  let key = sessionId;
-  const entry = { ws, fn: null, sess };
   const fn = (evt) => {
-    // If claude renamed this session (init reported a new id), follow it so the
-    // listeners map stays keyed by the id the SessionManager now uses — a later
-    // unsubscribe by the old id would otherwise miss and leak a stale listener
-    // that double-delivers every event on the next subscribe.
-    if (evt.type === "rename" && evt.oldId === key && evt.sessionId) {
-      listeners.delete(evt.oldId);
-      key = evt.sessionId;
-      listeners.set(key, entry);
-    }
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(evt));
   };
-  entry.fn = fn;
   sess.on("event", fn);
-  listeners.set(key, entry);
+  listeners.set(ws, { fn, sess });
   // Replay any control_request (permission / AskUserQuestion) prompts that were
   // emitted while no listener was attached — e.g. a background confirm-mode
   // session that hit a Write tool while you were viewing another chat. Without
   // this replay the background claude deadlocks waiting for a control_response
   // that the user never sees, and re-subscribing wouldn't resurface the prompt
-  // (history only covers completed messages). Use the post-rename `key`.
+  // (history only covers completed messages). sess.id is live, so it is already
+  // the post-rename id.
   for (const p of sess.pendingControl || []) {
     if (ws.readyState !== ws.OPEN) break;
     ws.send(
       JSON.stringify({
         type: "claude",
         data: { type: "control_request", request_id: p.request_id, request: p.request },
-        sessionId: key,
+        sessionId: sess.id,
       }),
     );
   }

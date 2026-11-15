@@ -23,6 +23,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { sessionLogPath, fileToTextBlock } from "./util.js";
+import { safeProcessEnv } from "./config.js";
 
 // sessions.js assigns these at module load: status-bus broadcast + state-file
 // persist both live there. Kept as a mutable object to dodge the circular
@@ -273,6 +274,17 @@ export class CodexSession extends EventEmitter {
         this.emit("event", { type: "claude", data: { type: "assistant", message: { id: msgId, role: "assistant", content } }, sessionId: this.id });
         this.appendTranscript({ type: "assistant", uuid: randomUUID(), message: { id: msgId, role: "assistant", content } });
       }
+      // Usage sidecar so this turn shows up in the Usage panel's local ledger
+      // (server/usage.js scans transcripts; codex's assistant records carry no
+      // usage of their own). loadHistory ignores unknown record types.
+      this.appendTranscript({
+        type: "usage",
+        uuid: randomUUID(),
+        engine: "codex",
+        model: this.model,
+        timestamp: new Date().toISOString(),
+        usage: result.usage,
+      });
       this.emit("event", { type: "claude", data: result, sessionId: this.id });
       this._endTurn();
       return;
@@ -390,9 +402,11 @@ export class CodexSession extends EventEmitter {
     this.bufLen = 0;
     this._stateChanged();
 
-    // Codex must NOT see an OPENAI_API_KEY — that would silently switch it from
-    // the ChatGPT plan login to pay-per-token API billing.
-    const env = { ...process.env };
+    // safeProcessEnv() (not process.env) so the web UI's own AUTH_PASSWORD /
+    // AUTH_SECRET never reach the CLI — see config.js SECRET_ENV_KEYS.
+    // Codex must additionally NOT see an OPENAI_API_KEY — that would silently
+    // switch it from the ChatGPT plan login to pay-per-token API billing.
+    const env = safeProcessEnv();
     delete env.OPENAI_API_KEY;
 
     let proc;

@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, Suspense, lazy, useEffect, useRef, useState } from "react";
 import { useSocket } from "./hooks/useSocket.js";
 import Sidebar from "./components/Sidebar.jsx";
 import Message from "./components/Message.jsx";
@@ -6,9 +6,16 @@ import PromptCard from "./components/PromptCard.jsx";
 import Composer from "./components/Composer.jsx";
 import FileTree from "./components/FileTree.jsx";
 import Editor from "./components/Editor.jsx";
-import Terminal from "./components/Terminal.jsx";
+// xterm + its addon and stylesheet are ~85 KB gzipped and only matter once the
+// user opens the TUI or Shell overlay, so the terminal is a lazy chunk rather
+// than part of the initial bundle.
+const Terminal = lazy(() => import("./components/Terminal.jsx"));
 import Skills from "./components/Skills.jsx";
+// The usage panel pulls four provider quota APIs + a transcript ledger; it is
+// only opened on demand, so keep it out of the initial bundle.
+const Usage = lazy(() => import("./components/Usage.jsx"));
 import ModelPicker from "./components/ModelPicker.jsx";
+import Lightbox from "./components/Lightbox.jsx";
 import Login from "./components/Login.jsx";
 
 const empty = [];
@@ -96,7 +103,7 @@ function VisionNote({ note }) {
   return (
     <div className="vision-note">
       <button className="vision-note-head" onClick={() => setOpen((o) => !o)}>
-        🖼 已由 {note.model} 转写为文字{note.truncated ? "（内容被截断）" : ""} · {open ? "收起" : "查看"}
+        🖼 transcribed to text by {note.model}{note.truncated ? " (truncated)" : ""} · {open ? "hide" : "show"}
       </button>
       {open && <pre className="vision-note-body">{note.text}</pre>}
     </div>
@@ -166,6 +173,7 @@ export default function App() {
   const [status, setStatus] = useState("connecting");
   const [termMode, setTermMode] = useState(null); // null | "tui" | "shell"
   const [skillsOpen, setSkillsOpen] = useState(false); // Skills manager overlay
+  const [usageOpen, setUsageOpen] = useState(false); // Usage/quota overlay
   const [editFile, setEditFile] = useState(null); // { path, cwd } when editing a file in main area
   const [authed, setAuthed] = useState(null); // null=checking, false=show login, true=app
   const [toast, setToast] = useState(""); // transient server error banner
@@ -178,6 +186,12 @@ export default function App() {
   // height so the restore effect can hold the user's position by the delta.
   const suppressAutoScrollRef = useRef(false);
   const prependRestoreRef = useRef(null); // { prev: scrollHeight, sessionId }
+  // Forces ONE scroll-to-bottom on the next commit regardless of where the
+  // viewport currently sits. Set when the user's intent is unambiguously "show
+  // me the end": opening/switching a chat, loading its history, sending a
+  // message. Streaming tokens don't set it — those only follow if the user is
+  // already at the bottom (see the auto-scroll effect).
+  const pinBottomRef = useRef(true);
   const toastTimer = useRef(null);
   // Transcriptions of images that were sent to a text-only model, keyed by
   // session id and then by the user message's uid, so each note renders under
@@ -364,6 +378,7 @@ export default function App() {
         // A fresh history load should pin to the bottom; clear any stale
         // suppress flag from a prior "Load older" in another session.
         suppressAutoScrollRef.current = false;
+        pinBottomRef.current = true;
         break;
       case "historyMore": {
         // An older page of the transcript (preceded by the "Load older"
@@ -427,7 +442,7 @@ export default function App() {
         // The server is transcribing the attached images with a vision model
         // because the active model can't take them. It's a multi-second round
         // trip, so say so rather than leaving the composer looking stuck.
-        flashToast(`正在用 ${evt.model} 转写图片…`);
+        flashToast(`Transcribing the image with ${evt.model}…`);
         break;
       case "vision-transcribed":
         // Record it against the user message that carried the images (uid), so
@@ -445,7 +460,7 @@ export default function App() {
         // take one. The bubble above already shows the raw 400; this adds the
         // actionable half.
         flashToast(
-          `${evt.model} 不支持图片输入。请切换到 ${describeModel || visionModels[0] || "一个视觉模型"}，或改用文字描述。`,
+          `${evt.model} does not accept image input. Switch to ${describeModel || visionModels[0] || "a vision model"}, or describe it in text.`,
         );
         break;
       case "payload-too-large":
@@ -454,7 +469,7 @@ export default function App() {
         // re-sent, so every message fails with "failed to read request body".
         // The bubble above already shows the raw 400; this adds the way out.
         flashToast(
-          "本会话累计的图片/内容已超过网关 16MB 请求上限，重试无用。请新开一个会话继续 — 旧会话的记录（含图片）仍可查看。",
+          "This session's accumulated images/content exceed the gateway's 16MB request limit — retrying will not help. Start a new session; the old one (images included) stays readable.",
         );
         break;
       case "payload-near-limit":
@@ -462,7 +477,7 @@ export default function App() {
         // but requests still fit — for now. Warn while there's still time to
         // start a fresh session on the user's own terms.
         flashToast(
-          "本会话累计内容已超过 12MB，正在接近网关 16MB 请求上限。建议尽快新开会话（旧会话记录仍可查看），避免之后所有消息报错。",
+          "This session has passed 12MB and is approaching the gateway's 16MB request limit. Start a new session soon (the old one stays readable) before every message starts failing.",
         );
         break;
       case "error":
@@ -737,12 +752,16 @@ export default function App() {
       }
       return { ...prev, [sessionId]: arr };
     });
-    sendRef.current?.({ type: "list" });
+    // No `list` request here: the server's statusBus already broadcasts a fresh
+    // session list to every client on the same `result` event (sessions.js
+    // emitStatus), so asking for one made every turn serialize + ship the whole
+    // list twice.
   }
 
   function newChat() {
     const cwd = selectedCwd || workspaceRoot;
     suppressAutoScrollRef.current = false; // fresh chat lands at the bottom
+    pinBottomRef.current = true;
     send({ type: "start", cwd, model: selectedModel, confirm: confirmMode });
   }
 
@@ -802,6 +821,7 @@ export default function App() {
     // with the session's current `busy` so the composer reflects its state.
     send({ type: "subscribe", sessionId: id });
     suppressAutoScrollRef.current = false; // switching into a session pins to bottom
+    pinBottomRef.current = true;
     setNav(null);
   }
 
@@ -832,6 +852,7 @@ export default function App() {
       .filter((a) => a.kind !== "image")
       .map((a) => ({ name: a.name, mediaType: a.mediaType, size: a.size }));
     const uid = `u${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    pinBottomRef.current = true; // sending always jumps to the end
     setMsgs((prev) => ({
       ...prev,
       [activeId]: [
@@ -874,7 +895,7 @@ export default function App() {
     // inlined as text by the backend and need no notice.
     const hasImage = attachments.some((a) => a.kind === "image");
     if (hasImage && !isVisionModel(model)) {
-      flashToast(`图片将先由 ${describeModel || "视觉模型"} 转写为文字，再交给 ${model}。`);
+      flashToast(`The image will be transcribed to text by ${describeModel || "the vision model"} first, then handed to ${model}.`);
     }
     deliverSend(text, attachments);
   }
@@ -1038,12 +1059,25 @@ export default function App() {
   // gets a new identity on every setMsgs, so depending on it follows tokens.
   // Suppressed on the commit that follows a "Load older" prepend (the restore
   // effect above holds the position instead).
+  //
+  // Only follow the output when the user is already parked at the bottom.
+  // Unconditional scrolling meant that scrolling up to re-read something
+  // mid-turn yanked the viewport back down on the very next token — the
+  // transcript was unreadable until the turn finished. `behavior:"auto"` too:
+  // a smooth scroll animation restarted per token and never kept up anyway.
   useEffect(() => {
     if (suppressAutoScrollRef.current) {
       suppressAutoScrollRef.current = false;
       return;
     }
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = messagesRef.current;
+    const forced = pinBottomRef.current;
+    if (forced) pinBottomRef.current = false;
+    // NEAR_BOTTOM_PX of slack so "basically at the bottom" still counts (a
+    // half-rendered code block or an image loading can shift things by a few px).
+    const NEAR_BOTTOM_PX = 120;
+    if (!forced && el && el.scrollHeight - el.scrollTop - el.clientHeight > NEAR_BOTTOM_PX) return;
+    messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
   }, [activeMsgs, busy]);
 
   if (authed === null) {
@@ -1105,6 +1139,7 @@ export default function App() {
             {confirmMode ? "Confirm ✓" : "Confirm"}
           </button>
           <button onClick={() => setSkillsOpen(true)} title="Manage Claude Code skills">Skills</button>
+          <button onClick={() => setUsageOpen(true)} title="Usage & quota across every model subscription">Usage</button>
           <button
             className="nav-btn nav-files"
             onClick={() => setNav((n) => (n === "files" ? null : "files"))}
@@ -1186,11 +1221,13 @@ export default function App() {
                 ✕ close
               </button>
             </div>
-            {termMode === "shell" ? (
-              <Terminal key="shell" path="/shell" cwd={selectedCwd || workspaceRoot} />
-            ) : (
-              <Terminal key="tui" path="/term" />
-            )}
+            <Suspense fallback={<div className="term-loading">starting terminal…</div>}>
+              {termMode === "shell" ? (
+                <Terminal key="shell" path="/shell" cwd={selectedCwd || workspaceRoot} />
+              ) : (
+                <Terminal key="tui" path="/term" />
+              )}
+            </Suspense>
           </div>
         </div>
       )}
@@ -1198,6 +1235,14 @@ export default function App() {
       {skillsOpen && (
         <Skills cwd={selectedCwd || workspaceRoot} workspaceRoot={workspaceRoot} onClose={() => setSkillsOpen(false)} />
       )}
+
+      {usageOpen && (
+        <Suspense fallback={null}>
+          <Usage onClose={() => setUsageOpen(false)} />
+        </Suspense>
+      )}
+
+      <Lightbox />
     </div>
   );
 }

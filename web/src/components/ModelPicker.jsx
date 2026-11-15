@@ -16,7 +16,7 @@ function capsOf(caps, name) {
     vision: !!c.vision,
     imagegen: !!c.imagegen,
     video: !!c.video,
-    source: c.source || "本地网关模型",
+    source: c.source || "Local gateway models",
   };
 }
 
@@ -25,10 +25,10 @@ function capsOf(caps, name) {
 function chips(c) {
   if (!c) return null;
   const out = [];
-  if (c.imagegen) out.push(<span key="ig" className="chip chip-gen">生图</span>);
-  if (c.video) out.push(<span key="vd" className="chip chip-gen">生视频</span>);
-  if (c.vision) out.push(<span key="vi" className="chip">多模态</span>);
-  else out.push(<span key="tx" className="chip chip-text">文本</span>);
+  if (c.imagegen) out.push(<span key="ig" className="chip chip-gen">image gen</span>);
+  if (c.video) out.push(<span key="vd" className="chip chip-gen">video gen</span>);
+  if (c.vision) out.push(<span key="vi" className="chip">vision</span>);
+  else out.push(<span key="tx" className="chip chip-text">text</span>);
   return <span className="chips">{out}</span>;
 }
 
@@ -36,10 +36,10 @@ function chips(c) {
 function describe(c) {
   if (!c) return "";
   const parts = [];
-  parts.push(c.vision ? "支持图片输入（贴图/附件直接看图）" : "仅文本输入（贴图会自动转写为文字）");
-  if (c.imagegen) parts.push("支持图片生成");
-  if (c.video) parts.push("支持视频生成");
-  if (c.imagegen) parts.push("生成走订阅额度，不额外计费");
+  parts.push(c.vision ? "Accepts image input (pasted screenshots / attachments are seen directly)" : "Text input only (images are transcribed to text first)");
+  if (c.imagegen) parts.push("Can generate images");
+  if (c.video) parts.push("Can generate video");
+  if (c.imagegen) parts.push("Generation draws on the subscription allowance, not extra billing");
   return parts.join(" · ");
 }
 
@@ -70,7 +70,7 @@ export default function ModelPicker({ value, options, caps, onChange, onOpen }) 
   const groupIndex = new Map();
   for (const m of options) {
     const c = capsOf(caps, m);
-    const src = c ? c.source : "本地网关模型";
+    const src = c ? c.source : "Local gateway models";
     if (!groupIndex.has(src)) {
       groupIndex.set(src, groups.length);
       groups.push({ source: src, models: [] });
@@ -93,9 +93,9 @@ export default function ModelPicker({ value, options, caps, onChange, onOpen }) 
         <span className="model-pick-name">{value}</span>
         {current && (
           <span className="chips">
-            {current.imagegen && <span className="chip chip-gen">生图</span>}
-            {current.video && <span className="chip chip-gen">生视频</span>}
-            {current.vision ? <span className="chip">多模态</span> : <span className="chip chip-text">文本</span>}
+            {current.imagegen && <span className="chip chip-gen">image gen</span>}
+            {current.video && <span className="chip chip-gen">video gen</span>}
+            {current.vision ? <span className="chip">vision</span> : <span className="chip chip-text">text</span>}
           </span>
         )}
         <span className="model-pick-caret">▾</span>

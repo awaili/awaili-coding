@@ -14,17 +14,17 @@ import { config } from "./config.js";
 // of an error, a stack trace, or code, where a summary is useless because the
 // exact identifiers and numbers are the whole point. So the prompt asks for a
 // verbatim transcription, explicitly not a summary.
-const PROMPT = `你在为一个看不到图片的编码助手做「图像转文字」。请把下面图片中的信息逐字转写出来。
+const PROMPT = `You are transcribing images for a coding assistant that cannot see them. Transcribe the information in the image(s) below verbatim.
 
-要求：
-- 所有可见文字一律照抄，包括报错信息、堆栈、代码、终端输出、文件路径、数字、标识符、按钮与菜单文案。不要概括、不要省略、不要翻译、不要改写。
-- 保留原有的缩进、换行与层级结构。代码和终端输出用 \`\`\` 包裹并标注语言。
-- 界面截图：先用一行说明这是什么界面（例如「VS Code 编辑器，显示一个 TypeScript 报错」），再转写其中的文字。
-- 图表、照片等没有文字的图：客观描述其内容、结构、关键数值与趋势。
-- 有多张图时按 [图1] [图2] … 分段，每段套用上面的规则。
-- 某处文字模糊无法辨认时写 [不清晰]，不要猜测。
+Rules:
+- Copy every visible character exactly: error messages, stack traces, code, terminal output, file paths, numbers, identifiers, button and menu labels. Do not summarize, omit, translate, or rephrase — keep the original language of the text.
+- Preserve indentation, line breaks and hierarchy. Wrap code and terminal output in \`\`\` fences with a language tag.
+- UI screenshots: open with one line naming what the screen is (e.g. "VS Code editor showing a TypeScript error"), then transcribe the text in it.
+- Images with no text (charts, photos): describe the content, structure, key values and trends factually.
+- With multiple images, split the output into [Image 1] [Image 2] … sections and apply these rules to each.
+- Where text is too blurry to read, write [unclear] — never guess.
 
-只输出转写结果，不要加任何评论、前言或总结。`;
+Output only the transcription: no commentary, preamble or summary.`;
 
 const MAX_TOKENS = Number(process.env.VISION_MAX_TOKENS) || 4096;
 const TIMEOUT_MS = Number(process.env.VISION_TIMEOUT_MS) || 60_000;
@@ -67,7 +67,7 @@ export async function transcribeImages(attachments, { model, signal } = {}) {
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`${describeModel} 转写失败: HTTP ${res.status} ${body.slice(0, 300)}`);
+    throw new Error(`${describeModel} transcription failed: HTTP ${res.status} ${body.slice(0, 300)}`);
   }
 
   const j = await res.json();
@@ -76,7 +76,7 @@ export async function transcribeImages(attachments, { model, signal } = {}) {
     .map((b) => b.text)
     .join("\n")
     .trim();
-  if (!text) throw new Error(`${describeModel} 转写返回了空内容`);
+  if (!text) throw new Error(`${describeModel} returned an empty transcription`);
 
   return { text, model: describeModel, truncated: j.stop_reason === "max_tokens" };
 }

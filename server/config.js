@@ -108,7 +108,8 @@ export const config = {
   imageBudgetBytes: (Number(process.env.SESSION_IMAGE_BUDGET_MB) || 12) * 1024 * 1024,
   disableBetas: process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS || "1",
   port: Number(process.env.PORT) || 3001,
-  // 仅监听回环口，避免后端绕过 nginx 直接暴露在 0.0.0.0（明文 HTTP + 跳过 TLS）。
+  // Loopback only, so the backend is never exposed on 0.0.0.0 past nginx
+  // (plaintext HTTP, TLS skipped).
   host: process.env.HOST || "127.0.0.1",
   workspaceRoot: resolve(process.env.WORKSPACE_ROOT || resolve(root, "workspace")),
   skipPermissions: (process.env.SKIP_PERMISSIONS ?? "1") !== "0",
@@ -175,9 +176,30 @@ export const config = {
   reaperIntervalMs: Number(process.env.REAPER_INTERVAL_MS) || 60 * 1000,
 };
 
+// Env vars that must NEVER reach a child process. Every spawn site here
+// inherits the server's environment, and the server's environment carries the
+// web UI's own credentials: AUTH_PASSWORD is the login password and AUTH_SECRET
+// is the HMAC key that signs session cookies (leaking it lets anyone forge a
+// cookie for anyone, and rotating the password doesn't help). The children are
+// a fully-autonomous `claude` with Bash, the codex/grok CLIs, and an
+// interactive root shell — i.e. precisely the places where `env | grep AUTH`
+// is one command away. CLAUDE_CODE_OAUTH_TOKEN (the Claude subscription token)
+// is stripped too: only `native`-routed sessions need it, and Session.env()
+// injects it explicitly for those, so a gateway-routed session no longer
+// carries a subscription bearer it has no business holding.
+const SECRET_ENV_KEYS = ["AUTH_PASSWORD", "AUTH_SECRET", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+// `process.env` minus the server-only secrets above. EVERY spawn site must
+// build its child env from this, never from process.env directly.
+export function safeProcessEnv() {
+  const env = { ...process.env };
+  for (const k of SECRET_ENV_KEYS) delete env[k];
+  return env;
+}
+
 export function childEnv() {
   return {
-    ...process.env,
+    ...safeProcessEnv(),
     ANTHROPIC_BASE_URL: config.anthropicBaseUrl,
     ANTHROPIC_MODEL: config.anthropicModel,
     ANTHROPIC_DEFAULT_HAIKU_MODEL: config.anthropicHaikuModel,

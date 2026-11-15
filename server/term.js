@@ -3,7 +3,7 @@ import { resolve, dirname, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
-import { config } from "./config.js";
+import { config, safeProcessEnv } from "./config.js";
 import { internalToken } from "./internal-token.js";
 
 const require = createRequire(import.meta.url);
@@ -53,7 +53,8 @@ function spawnTui() {
     rows: 28,
     cwd: root,
     env: {
-      ...process.env,
+      // safeProcessEnv(), not process.env: see config.js SECRET_ENV_KEYS.
+      ...safeProcessEnv(),
       TERM: "xterm", // verified clean with blessed (xterm-256color trips a terminfo parse error)
       CODE_UI_WS: wsUrl,
       CODE_UI_CWD: config.workspaceRoot,
@@ -72,7 +73,10 @@ function spawnShell(req) {
     cols: 90,
     rows: 28,
     cwd: safeCwd(req),
-    env: { ...process.env, TERM: "xterm" },
+    // This is an interactive shell running as the server's user, so it is the
+    // single most exposed spawn site: safeProcessEnv() keeps the UI's login
+    // password + cookie-signing secret out of it (config.js SECRET_ENV_KEYS).
+    env: { ...safeProcessEnv(), TERM: "xterm" },
   });
 }
 
@@ -81,7 +85,10 @@ function spawnShell(req) {
  * a server-side PTY. `spawnFn(req)` returns the node-pty process to attach.
  */
 function createPtyWs(spawnFn) {
-  const wss = new WebSocketServer({ noServer: true });
+  // Terminal traffic is keystrokes and resize events; 1MB is already generous
+  // (a large paste) and keeps `ws`'s 100MB default from being a free way to
+  // balloon the server's heap.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
 
   wss.on("connection", (ws, req) => {
     let ptyProc = null;

@@ -1,5 +1,5 @@
 import express from "express";
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
@@ -11,7 +11,8 @@ import { internalToken } from "./internal-token.js";
 import filesRouter from "./files.js";
 import skillsRouter from "./skills.js";
 import { confineCwd } from "./util.js";
-import { readTranscriptImage } from "./sessions.js";
+import { readTranscriptImage } from "./transcript.js";
+import { getUsage, clearUsageCache } from "./usage.js";
 import {
   requireAuth,
   isAuthed,
@@ -36,12 +37,55 @@ app.use(express.json({ limit: "20mb" }));
 // when served behind a TLS-terminating reverse proxy.
 app.set("trust proxy", true);
 
+// Baseline security headers. Defense in depth: assistant output, tool results
+// and workspace .md files are all rendered through dangerouslySetInnerHTML, and
+// although DOMPurify sanitizes them first, a sanitizer bypass should not be a
+// one-step path to loading an attacker's script or framing the UI.
+//
+// The policy is deliberately not stricter than the app can tolerate:
+//   - 'unsafe-inline' for styles: React `style={{…}}` props and KaTeX's
+//     generated markup are inline styles; blocking them breaks the layout.
+//   - 'unsafe-eval' for scripts: jsxgraph compiles its JessieCode expressions
+//     with eval, and figure.js builds plot functions with `new Function`.
+//     Narrow it the day interactive figures go away.
+// Even so this blocks remote/injected <script src>, inline <script>, plugins,
+// form hijacking and clickjacking.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-eval'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "connect-src 'self' ws: wss:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
+app.use((_req, res, next) => {
+  res.setHeader("Content-Security-Policy", CSP);
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Frame-Options", "DENY"); // for anything that predates frame-ancestors
+  next();
+});
+
 // --- Public auth endpoints (must be registered before requireAuth) ---
 // Simple per-IP login throttle: a small in-memory failure counter with
 // exponential lockout. Prevents brute-forcing a weak operator-set password.
 const loginFails = new Map(); // ip -> { count, lockedUntil }
 const LOCK_BASE_MS = 1000;
 const LOCK_MAX_MS = 60_000;
+// An entry is meaningless once its lockout has expired by this much — the
+// counter only escalates consecutive failures. Without expiry the map held one
+// entry per source IP for the life of the process; a scanner sweeping the
+// public address would grow it without bound.
+const FAIL_TTL_MS = 10 * 60 * 1000;
+function sweepLoginFails(now) {
+  for (const [ip, f] of loginFails) {
+    if (now - (f.lockedUntil || 0) > FAIL_TTL_MS) loginFails.delete(ip);
+  }
+}
 function loginRateCheck(ip) {
   const now = Date.now();
   const f = loginFails.get(ip);
@@ -49,10 +93,14 @@ function loginRateCheck(ip) {
   return true;
 }
 function loginFail(ip) {
-  const f = loginFails.get(ip) || { count: 0, lockedUntil: 0 };
+  const now = Date.now();
+  const prev = loginFails.get(ip);
+  // A long-expired entry starts over rather than resuming the old escalation.
+  const f = prev && now - prev.lockedUntil <= FAIL_TTL_MS ? prev : { count: 0, lockedUntil: 0 };
   f.count += 1;
-  f.lockedUntil = Date.now() + Math.min(LOCK_MAX_MS, LOCK_BASE_MS * 2 ** Math.min(f.count, 10));
+  f.lockedUntil = now + Math.min(LOCK_MAX_MS, LOCK_BASE_MS * 2 ** Math.min(f.count, 10));
   loginFails.set(ip, f);
+  if (loginFails.size > 64) sweepLoginFails(now);
 }
 function loginSuccess(ip) {
   loginFails.delete(ip);
@@ -96,7 +144,7 @@ app.use("/api", skillsRouter);
 // path under ~/.claude/projects, so without this `session=../../foo` would read
 // arbitrary .jsonl files.
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-app.get("/api/transcript/image", (req, res) => {
+app.get("/api/transcript/image", async (req, res) => {
   const cwd = confineCwd(String(req.query.cwd || ""));
   const session = String(req.query.session || "");
   const uuid = String(req.query.uuid || "");
@@ -104,7 +152,10 @@ app.get("/api/transcript/image", (req, res) => {
   if (!cwd || !ID_RE.test(session) || !ID_RE.test(uuid) || Number.isNaN(idx) || idx < 0) {
     return res.status(400).type("text/plain").send("missing or invalid cwd, session, uuid, or idx");
   }
-  const img = readTranscriptImage(cwd, session, uuid, idx);
+  // Express 4 does not forward a rejected promise from an async handler to the
+  // error middleware, so catch here rather than letting it become an
+  // unhandledRejection that takes the process down.
+  const img = await readTranscriptImage(cwd, session, uuid, idx).catch(() => null);
   if (!img) return res.status(404).type("text/plain").send("image not found");
   res.setHeader("Content-Type", img.mediaType);
   res.setHeader("Cache-Control", "private, max-age=3600");
@@ -152,11 +203,11 @@ app.get("/api/models", async (_req, res) => {
   for (const m of models) {
     const route = routeForModel(m);
     const engine = route.engine;
-    let source = "本地网关模型";
-    if (route.native) source = "Claude Pro 订阅";
-    else if (engine === "codex") source = "ChatGPT 套餐（Codex）";
-    else if (engine === "grok") source = "Grok 月包订阅";
-    else if (route.baseUrl && route.baseUrl !== (config.ollamaBaseUrl || config.anthropicBaseUrl)) source = "外部网关";
+    let source = "Local gateway models";
+    if (route.native) source = "Claude Pro subscription";
+    else if (engine === "codex") source = "ChatGPT plan (Codex)";
+    else if (engine === "grok") source = "Grok subscription";
+    else if (route.baseUrl && route.baseUrl !== (config.ollamaBaseUrl || config.anthropicBaseUrl)) source = "External gateway";
     capabilities[m] = {
       vision: visionModels.some((v) => matchesModel(m, v)),
       imagegen: engine === "grok" || engine === "codex",
@@ -174,13 +225,48 @@ app.get("/api/models", async (_req, res) => {
   });
 });
 
+// Cross-provider usage/quota view (server/usage.js). `probe=0` skips the two
+// 1-token probe requests (claude's unified rate-limit headers, grok's weekly
+// allowance headers) and serves whatever the last probe cached — the provider
+// metadata calls are free, the probes are not. `force=1` drops every cache
+// entry first. `days` sizes the local transcript ledger window.
+app.get("/api/usage", async (req, res) => {
+  const probe = req.query.probe !== "0";
+  const days = Math.min(Math.max(Number.parseInt(req.query.days, 10) || 30, 1), 45);
+  const withLedger = req.query.ledger !== "0";
+  if (req.query.force === "1") clearUsageCache();
+  try {
+    res.json(await getUsage({ probe, days, withLedger }));
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) });
+  }
+});
+
 if (isProd) {
   const dist = resolve(root, "web", "dist");
   if (existsSync(dist)) {
-    app.use(express.static(dist));
+    app.use(
+      express.static(dist, {
+        // Vite emits content-hashed names under /assets (index-<hash>.js, the
+        // KaTeX fonts, …), so those bytes can never change — serve them
+        // immutable instead of express.static's default `max-age=0`, which made
+        // every page load revalidate a ~3MB bundle. index.html must stay
+        // uncached: it is what points at the current hashes.
+        setHeaders(res, filePath) {
+          if (filePath.includes(`${sep}assets${sep}`)) {
+            res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+          } else {
+            res.setHeader("Cache-Control", "no-cache");
+          }
+        },
+      }),
+    );
     // SPA fallback — but only for non-/api paths, so an unknown /api/* route
     // returns a proper 404 JSON instead of index.html (200, text/html).
-    app.get(/^(?!\/api).*/, (_req, res) => res.sendFile(resolve(dist, "index.html")));
+    app.get(/^(?!\/api).*/, (_req, res) => {
+      res.setHeader("Cache-Control", "no-cache"); // must not pin stale asset hashes
+      res.sendFile(resolve(dist, "index.html"));
+    });
   } else {
     app.get("/", (_req, res) =>
       res.type("text/plain").send("Build the frontend first: npm run build"),
