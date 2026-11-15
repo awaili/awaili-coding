@@ -14,7 +14,7 @@
 // carries attachments; probing per message would be wasteful. A hand-written
 // list is still honoured, but only as an override (see config.visionModels /
 // visionModelsExclude) — the gateway is the source of truth.
-import { config } from "./config.js";
+import { config, routeForModel } from "./config.js";
 
 const TTL_MS = Number(process.env.MODEL_CATALOG_TTL_MS) || 5 * 60 * 1000;
 
@@ -72,12 +72,35 @@ async function build() {
     /* gateway unreachable — fall through to the configured list */
   }
   const have = new Set(tagged.map((m) => m.name));
+  // Native (subscription OAuth), engine-routed models (e.g. codex's gpt-*) and
+  // shim-routed models (MODEL_ROUTES baseUrl targets — e.g. hy4 via the
+  // OpenAI→Anthropic shim on :11435) live outside the gateway — probing
+  // /api/show would 404 them out of the dropdown. Take them as-is from the
+  // configured list instead, and assume vision: claude models and codex plan
+  // models all accept image input, and there's no gateway to ask. Shim-routed
+  // vision depends on the upstream — flip to visionModelsExclude when one
+  // turns out to be text-only.
+  const offGateway = config.availableModels
+    .filter((n) => !have.has(n))
+    .map((n) => ({ n, route: routeForModel(n) }))
+    .filter(
+      ({ route }) =>
+        route?.native ||
+        route?.engine ||
+        // A baseUrl override that leaves the global gateway (unmatched models
+        // keep route.baseUrl === the gateway and must stay probed).
+        (!!route?.baseUrl && !route?.native && !route?.engine && route.baseUrl !== base),
+    )
+    .map(({ n }) => ({ name: n, capabilities: ["vision"] }));
+  const offGatewayNames = new Set(offGateway.map((m) => m.name));
   const probed = (
     await Promise.all(
-      config.availableModels.filter((n) => !have.has(n)).map((n) => probeModel(base, n)),
+      config.availableModels
+        .filter((n) => !have.has(n) && !offGatewayNames.has(n))
+        .map((n) => probeModel(base, n)),
     )
   ).filter(Boolean);
-  const entries = [...tagged, ...probed];
+  const entries = [...tagged, ...offGateway, ...probed];
 
   const detected = entries
     .filter((e) => e.capabilities.includes("vision"))

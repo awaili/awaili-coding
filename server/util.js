@@ -1,6 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { realpathSync } from "node:fs";
-import { resolve, relative, dirname, basename, sep } from "node:path";
+import { resolve, relative, dirname, basename, sep, join } from "node:path";
+import { homedir } from "node:os";
 import { config } from "./config.js";
 
 export async function mkdirp(p) {
@@ -51,4 +52,57 @@ export function safe(root, sub) {
   const real = realTarget || (realpathOrNull(dirname(target)) ? resolve(realpathOrNull(dirname(target)), basename(target)) : target);
   if (!inside(realRoot, real)) return null;
   return real;
+}
+// --- Shared session helpers (sessions.js and codex.js both use these) ---
+
+// sessionId is joined into a path, so reject anything outside a safe charset
+// (defense in depth — the HTTP caller is also validated upstream).
+export const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+// Claude Code stores each session's full transcript as JSONL under
+// ~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl. The sanitizer turns
+// path separators AND underscores/dots into dashes, so a cwd like
+// /data/.../idc_migrate lands in a dir named ...-idc-migrate (hyphen, not
+// underscore). The claude engine writes this file itself; the codex engine's
+// adapter writes the SAME shape so history loading stays engine-agnostic.
+export function sessionLogPath(cwd, sessionId) {
+  const sid = String(sessionId || "");
+  if (!ID_RE.test(sid)) return null; // caller treats null as "no transcript"
+  const enc = String(cwd).replace(/[\/\\._]/g, "-");
+  return join(homedir(), ".claude", "projects", enc, `${sid}.jsonl`);
+}
+
+const INLINE_TEXT_CAP = 200 * 1024; // 200 KB of decoded text per file
+
+// Turn a base64 attachment into an inline text block when it looks textual,
+// else a placeholder note. Shared by the claude and codex send paths.
+export function fileToTextBlock(b64, mediaType, name) {
+  let buf;
+  try {
+    buf = Buffer.from(b64, "base64");
+  } catch {
+    return null;
+  }
+  const head = buf.subarray(0, 8192);
+  const looksTextual = !head.includes(0);
+  const label = name ? `Attached file: ${name}` : "Attached file";
+  if (!looksTextual) {
+    return {
+      type: "text",
+      text: `[${label} — binary, ${mediaType || "unknown type"}, ${buf.length} bytes. Content not inlined.]`,
+    };
+  }
+  let text = buf.toString("utf8");
+  let truncated = "";
+  if (text.length > INLINE_TEXT_CAP) {
+    truncated = `\n[…truncated: ${buf.length} bytes total, showing first ${INLINE_TEXT_CAP} chars…]`;
+    text = text.slice(0, INLINE_TEXT_CAP);
+  }
+  // Fence language from the file extension (best-effort, ignored if unknown).
+  const ext = (name.split(".").pop() || "").toLowerCase();
+  const fence = ext ? ext : "";
+  return {
+    type: "text",
+    text: `[${label}]\n\`\`\`${fence}\n${text}\n\`\`\`${truncated}`,
+  };
 }

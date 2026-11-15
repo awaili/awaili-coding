@@ -141,8 +141,28 @@ input, textarea { font-family: inherit; }
 .topbar .title { font-weight: 600; }
 .topbar .spacer { flex: 1; }
 .topbar .model { font-family: var(--mono); font-size: 12px; color: var(--muted); }
-.topbar .model-pick { font-family: var(--mono); font-size: 12px; color: var(--muted); background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; max-width: 220px; }
-.topbar .model-pick:hover { color: var(--text); }
+.topbar .model-pick { font-family: var(--mono); font-size: 12px; color: var(--muted); background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; max-width: 260px; display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.topbar .model-pick:hover, .topbar .model-pick.open { color: var(--text); border-color: var(--accent); }
+.model-picker { position: relative; display: inline-flex; }
+.model-pick .model-pick-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-pick .model-pick-caret { flex: none; font-size: 10px; color: var(--muted); }
+
+/* Capability chips inside the picker button and menu rows. */
+.chips { display: inline-flex; gap: 3px; flex: none; }
+.chip { font-size: 10px; line-height: 14px; padding: 0 5px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+.chip-gen { background: color-mix(in srgb, var(--ok) 18%, var(--panel-2)); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); color: var(--ok); }
+.chip-text { color: var(--muted); }
+
+/* The dropdown panel itself. */
+.model-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 60; width: min(430px, 92vw); max-height: min(430px, 70vh); overflow-y: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.35); padding: 6px; }
+.model-group + .model-group { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; }
+.model-group-title { font-size: 11px; color: var(--muted); padding: 4px 8px 2px; letter-spacing: .03em; }
+.model-item { display: block; width: 100%; text-align: left; background: none; border: 0; border-radius: 8px; padding: 6px 8px; cursor: pointer; color: var(--text); }
+.model-item:hover { background: var(--panel-2); }
+.model-item.active { background: color-mix(in srgb, var(--accent) 14%, var(--panel-2)); }
+.model-item-head { display: flex; align-items: center; gap: 6px; }
+.model-item-name { font-family: var(--mono); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-item-desc { font-size: 11.5px; color: var(--muted); margin-top: 2px; line-height: 1.45; }
 .toast { margin: 8px 14px 0; padding: 8px 12px; background: var(--panel-2); border: 1px solid var(--err); border-radius: 8px; color: var(--err); font-size: 13px; cursor: pointer; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
 .dot.busy { background: var(--warn); animation: pulse 1s infinite; }

@@ -38,6 +38,41 @@ export const config = {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
+  // Long-lived Claude subscription OAuth token (from `claude setup-token`,
+  // 1-year validity). setup-token only PRINTS the token — it does not write a
+  // login into ~/.claude — so sessions routed `native` (see modelRoutes) need
+  // it injected as CLAUDE_CODE_OAUTH_TOKEN. Lives in .env.auth (secrets file,
+  // systemd EnvironmentFile), not .env.
+  nativeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || "",
+  // Per-model gateway routing: comma-separated `<prefix>=<target>` rules,
+  // first matching prefix wins. Target forms:
+  //   `native`        — the Claude subscription: no base URL or auth token
+  //                     injected, nativeOAuthToken supplied via
+  //                     CLAUDE_CODE_OAUTH_TOKEN (see above).
+  //   `engine:<name>` — a non-claude session engine. Currently `codex`: the
+  //                     official Codex CLI (ChatGPT-plan login) drives the
+  //                     session via the codex.js adapter.
+  //   `<baseUrl>`     — an Anthropic-protocol gateway, optionally followed by
+  //                     `|<auth token>` (e.g. `grok-=http://127.0.0.1:11435|k`).
+  // Models that match no rule use the global anthropicBaseUrl like before.
+  modelRoutes: (process.env.MODEL_ROUTES || "claude-=native")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((rule) => {
+      const eq = rule.indexOf("=");
+      if (eq < 0) return null;
+      const prefix = rule.slice(0, eq).trim();
+      const target = rule.slice(eq + 1).trim();
+      if (target === "native") return { prefix, native: true, engine: null, baseUrl: null, token: null };
+      if (target.startsWith("engine:"))
+        return { prefix, native: false, engine: target.slice(7).trim(), baseUrl: null, token: null };
+      const pipe = target.indexOf("|");
+      return pipe < 0
+        ? { prefix, native: false, engine: null, baseUrl: target, token: null }
+        : { prefix, native: false, engine: null, baseUrl: target.slice(0, pipe).trim(), token: target.slice(pipe + 1).trim() };
+    })
+    .filter(Boolean),
   // Force-include list of models that accept image (vision) input. Capability
   // is auto-detected from the gateway (see catalog.js — /api/tags and /api/show
   // both report a `capabilities` array containing "vision"), so this is only an
@@ -151,4 +186,13 @@ export function childEnv() {
     ANTHROPIC_AUTH_TOKEN: config.anthropicAuthToken,
     CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: config.disableBetas,
   };
+}
+
+// Resolve which gateway/auth a model name routes to (see config.modelRoutes).
+// Unrouted models fall back to the global gateway — the pre-routing behavior.
+export function routeForModel(model) {
+  for (const r of config.modelRoutes) {
+    if (model && model.startsWith(r.prefix)) return r;
+  }
+  return { native: false, engine: null, baseUrl: config.anthropicBaseUrl, token: config.anthropicAuthToken };
 }

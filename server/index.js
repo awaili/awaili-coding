@@ -3,8 +3,8 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
-import { config } from "./config.js";
-import { getCatalog } from "./catalog.js";
+import { config, routeForModel } from "./config.js";
+import { getCatalog, matchesModel } from "./catalog.js";
 import { attachWebSocket } from "./ws.js";
 import { attachTerm } from "./term.js";
 import { internalToken } from "./internal-token.js";
@@ -141,10 +141,34 @@ app.get("/api/models", async (_req, res) => {
   if (config.anthropicModel && !has.has(config.anthropicModel)) {
     models = [config.anthropicModel, ...models];
   }
+  // Per-model capability descriptors for the dropdown (web/src
+  // ModelPicker.jsx): vision = accepts image attachments (catalog's vision
+  // set, gateway-sourced); imagegen/video = can GENERATE images/video — the
+  // engine-routed CLI harnesses' built-in tools (grok's Imagine suite has
+  // image+video, codex's imagegen skill images only), both drawing from the
+  // subscription plan, not API billing. source = which subscription/channel
+  // the model rides on, shown as the dropdown's group headers.
+  const capabilities = {};
+  for (const m of models) {
+    const route = routeForModel(m);
+    const engine = route.engine;
+    let source = "本地网关模型";
+    if (route.native) source = "Claude Pro 订阅";
+    else if (engine === "codex") source = "ChatGPT 套餐（Codex）";
+    else if (engine === "grok") source = "Grok 月包订阅";
+    else if (route.baseUrl && route.baseUrl !== (config.ollamaBaseUrl || config.anthropicBaseUrl)) source = "外部网关";
+    capabilities[m] = {
+      vision: visionModels.some((v) => matchesModel(m, v)),
+      imagegen: engine === "grok" || engine === "codex",
+      video: engine === "grok",
+      source,
+    };
+  }
   res.json({
     default: config.anthropicModel,
     models,
     visionModels,
+    capabilities,
     describeModel: config.visionDescribeModel,
     source,
   });

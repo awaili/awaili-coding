@@ -3,11 +3,14 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
-import { config, childEnv } from "./config.js";
+import { config, childEnv, routeForModel } from "./config.js";
 import { buildClaudeArgs } from "./claude-args.js";
 import { availableSkillsForCwd, pickSkill } from "./skills.js";
 import { isVisionModel } from "./catalog.js";
 import { transcribeImages } from "./vision.js";
+import { sessionLogPath, fileToTextBlock } from "./util.js";
+import { CodexSession, codexHooks } from "./codex.js";
+import { GrokSession, grokHooks } from "./grok.js";
 
 const STATE_FILE = resolve(config.workspaceRoot, ".coding-ui-sessions.json");
 
@@ -25,24 +28,30 @@ function emitStatus() {
   statusBus.emit("change");
 }
 
-// Claude Code stores each session's full transcript as JSONL under
-// ~/.claude/projects/<sanitized-cwd>/<sessionId>.jsonl. The sanitizer turns
-// path separators AND underscores/dots into dashes, so a cwd like
-// /data/.../idc_migrate lands in a dir named ...-idc-migrate (hyphen, not
-// underscore). Mirror that here, or every session under an underscore- or
-// dot-named workspace looks "no transcript" and shows empty / gets pruned.
-// We read it to show prior conversation when a session is resumed (--resume
-// does NOT replay history in stream-json print mode, so without this the main
-// area stays empty).
-// sessionId is joined into a path, so reject anything outside a safe charset
-// (defense in depth — the HTTP caller is also validated upstream).
-const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-function sessionLogPath(cwd, sessionId) {
-  const sid = String(sessionId || "");
-  if (!ID_RE.test(sid)) return null; // caller treats null as "no transcript"
-  const enc = String(cwd).replace(/[\/\\._]/g, "-");
-  return join(homedir(), ".claude", "projects", enc, `${sid}.jsonl`);
+// The codex/grok engine adapters report busy/metrics changes through here
+// (their modules can't import this one — sessions.js constructs them).
+codexHooks.onStateChange = () => {
+  saveState();
+  emitStatus();
+};
+grokHooks.onStateChange = () => {
+  saveState();
+  emitStatus();
+};
+
+// Pick the session class by model routing: models routed to a `engine:*`
+// target run on that engine's adapter, everything else on the claude engine.
+function sessionClassFor(model) {
+  const engine = routeForModel(model).engine;
+  if (engine === "codex") return CodexSession;
+  if (engine === "grok") return GrokSession;
+  return Session;
 }
+
+// Transcript path (claude's JSONL under ~/.claude/projects/<sanitized-cwd>/)
+// lives in util.js now — shared with the codex engine adapter, which writes
+// the same shape. We read it to show prior conversation when a session is
+// resumed (--resume does NOT replay history in stream-json print mode).
 
 // Total base64 bytes of image blocks embedded in a session's transcript —
 // both pasted images (user content blocks) and tool results (e.g. a browser
@@ -361,15 +370,37 @@ class Session extends EventEmitter {
 
   // Child env with this session's model overriding the global default. All four
   // model aliases are set so background/haiku calls hit a model that resolves on
-  // the gateway (matches childEnv()'s single-model behavior).
+  // the session's route (matches childEnv()'s single-model behavior).
+  //
+  // Per-model routing (config.modelRoutes): a `native` route means the model is
+  // served by the claude CLI's own subscription OAuth — the gateway base URL,
+  // dummy auth token and beta-trimming var must NOT be injected (they would
+  // override ~/.claude credentials and 401). Any other route overrides the
+  // base URL (and token when the rule carries one) so future per-model shims
+  // can coexist with the global gateway.
   env() {
-    return {
+    const env = {
       ...childEnv(),
       ANTHROPIC_MODEL: this.model,
       ANTHROPIC_DEFAULT_HAIKU_MODEL: this.model,
       ANTHROPIC_DEFAULT_SONNET_MODEL: this.model,
       ANTHROPIC_DEFAULT_OPUS_MODEL: this.model,
     };
+    const route = routeForModel(this.model);
+    if (route.native) {
+      delete env.ANTHROPIC_BASE_URL;
+      delete env.ANTHROPIC_AUTH_TOKEN;
+      // Beta trimming exists only for non-Anthropic gateways; let the native
+      // client send whatever headers it wants.
+      delete env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS;
+      // setup-token doesn't write a login into ~/.claude — it only prints a
+      // long-lived token, so it must ride in via env.
+      if (config.nativeOAuthToken) env.CLAUDE_CODE_OAUTH_TOKEN = config.nativeOAuthToken;
+    } else {
+      if (route.baseUrl) env.ANTHROPIC_BASE_URL = route.baseUrl;
+      if (route.token) env.ANTHROPIC_AUTH_TOKEN = route.token;
+    }
+    return env;
   }
 
   start() {
@@ -811,38 +842,6 @@ function stripSkillInjection(text) {
 // Claude Messages API only accepts image + PDF document blocks, not arbitrary
 // binaries, and this gateway's models don't take document blocks). Inlined
 // text is capped to keep the prompt bounded; a truncation note is appended.
-const INLINE_TEXT_CAP = 200 * 1024; // 200 KB of decoded text per file
-function fileToTextBlock(b64, mediaType, name) {
-  let buf;
-  try {
-    buf = Buffer.from(b64, "base64");
-  } catch {
-    return null;
-  }
-  const head = buf.subarray(0, 8192);
-  const looksTextual = !head.includes(0);
-  const label = name ? `Attached file: ${name}` : "Attached file";
-  if (!looksTextual) {
-    return {
-      type: "text",
-      text: `[${label} — binary, ${mediaType || "unknown type"}, ${buf.length} bytes. Content not inlined.]`,
-    };
-  }
-  let text = buf.toString("utf8");
-  let truncated = "";
-  if (text.length > INLINE_TEXT_CAP) {
-    truncated = `\n[…truncated: ${buf.length} bytes total, showing first ${INLINE_TEXT_CAP} chars…]`;
-    text = text.slice(0, INLINE_TEXT_CAP);
-  }
-  // Fence language from the file extension (best-effort, ignored if unknown).
-  const ext = (name.split(".").pop() || "").toLowerCase();
-  const fence = ext ? ext : "";
-  return {
-    type: "text",
-    text: `[${label}]\n\`\`\`${fence}\n${text}\n\`\`\`${truncated}`,
-  };
-}
-
 // Restore persisted sessions now that the Session class is defined.
 loadState();
 
@@ -906,7 +905,7 @@ export const SessionManager = {
       const nextModel = model || s.model;
       const nextConfirm = confirm === undefined ? s.confirm : !!confirm;
       const resume = existsSync(sessionLogPath(s.cwd, sessionId) || "") ? sessionId : undefined;
-      const sess = new Session({ id: sessionId, cwd: s.cwd, resume, model: nextModel, confirm: nextConfirm });
+      const sess = new (sessionClassFor(nextModel))({ id: sessionId, cwd: s.cwd, resume, model: nextModel, confirm: nextConfirm });
       // The restart replaces the map entry with a fresh Session object, so
       // carry over everything the constructor doesn't take — otherwise a
       // model/confirm switch resets the sidebar row to "(no title)" and
@@ -925,11 +924,12 @@ export const SessionManager = {
     // the client still had cached), start a fresh conversation under that id
     // instead of --resume-ing into nothing.
     const resume = sessionId && existsSync(sessionLogPath(cwd, sessionId) || "") ? sessionId : undefined;
-    const sess = new Session({
+    const chosenModel = model || config.anthropicModel;
+    const sess = new (sessionClassFor(chosenModel))({
       id,
       cwd,
       resume,
-      model: model || config.anthropicModel,
+      model: chosenModel,
       confirm: confirm === undefined ? config.confirmTools : !!confirm,
     });
     sessions.set(id, sess);

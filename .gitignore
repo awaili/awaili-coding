@@ -1,5 +1,18 @@
+# --- Secrets / auth (never commit) ---
 .env
-.env.auth
-.env.gemini
-node_modules/*
-workspace/*
+.env.*
+!.env.example
+# Any other env-file shapes that slip in
+*.env
+!.env.example
+
+# --- Local agent / CLI state ---
+.claude/
+
+# --- Build artifacts & dependencies ---
+node_modules/
+web/dist/
+
+# --- Runtime data (sessions registry, workspaces, logs) ---
+workspace/
+*.log

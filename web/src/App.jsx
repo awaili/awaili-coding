@@ -8,6 +8,7 @@ import FileTree from "./components/FileTree.jsx";
 import Editor from "./components/Editor.jsx";
 import Terminal from "./components/Terminal.jsx";
 import Skills from "./components/Skills.jsx";
+import ModelPicker from "./components/ModelPicker.jsx";
 import Login from "./components/Login.jsx";
 
 const empty = [];
@@ -153,6 +154,7 @@ export default function App() {
   const [promptsBy, setPromptsBy] = useState({}); // {sessionId: [{requestId, request}]}
   const [confirmMode, setConfirmMode] = useState(false); // interactive confirm mode for new chats
   const [visionModels, setVisionModels] = useState([]); // gateway models that accept image input
+  const [modelCaps, setModelCaps] = useState({}); // {model: ["vision","imagegen"]} from /api/models
   const [cwdBy, setCwdBy] = useState({}); // {sessionId: cwd}
   const [model, setModel] = useState("glm-5.2:cloud"); // active session's live model
   const [modelOptions, setModelOptions] = useState(["glm-5.2:cloud"]);
@@ -232,6 +234,7 @@ export default function App() {
         const list = Array.isArray(j.models) && j.models.length ? j.models : [j.default || "glm-5.2:cloud"];
         setDefaultModel(j.default || list[0]);
         if (Array.isArray(j.visionModels)) setVisionModels(j.visionModels);
+        if (j.capabilities && typeof j.capabilities === "object") setModelCaps(j.capabilities);
         if (j.describeModel) setDescribeModel(j.describeModel);
         setModelOptions((opts) => {
           const merged = [...list];
@@ -1085,19 +1088,13 @@ export default function App() {
               : "no session"}
           </span>
           <span className="spacer" />
-          <select
-            className="model-pick"
+          <ModelPicker
             value={activeId ? model : selectedModel}
+            options={modelOptions}
+            caps={modelCaps}
             onChange={onModelChange}
-            onFocus={() => refreshModels(false)}
-            title={activeId ? "Switch this session's model (restarts with resume)" : "Model for the next new chat"}
-          >
-            {modelOptions.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </select>
+            onOpen={() => refreshModels(false)}
+          />
           <button onClick={() => setTermMode("tui")}>TUI</button>
           <button onClick={() => setTermMode("shell")}>Shell</button>
           <button
