@@ -909,14 +909,65 @@ const STOP = new Set(
     .filter(Boolean),
 );
 
+// Operations vocabulary. Every deployment/ops skill describes itself with these
+// verbs and nouns, so they identify a KIND of work, never a particular skill —
+// matching on them injected a specific skill ("publish the WeChat bot") into
+// any sentence about restarting a service or shipping to production. Dropped
+// from both sides of the comparison, which leaves each skill matched on its
+// subject (wechat/bot/微信, site/domain/cert, db/mariadb/数据库).
+for (const w of ("deploy deployment publish publishing production prod staging live release " +
+  "restart restarted reboot start started stop stopped status running run runs " +
+  "service services server servers daemon systemd process port host machine box instance " +
+  "update updates updated upgrade sync synced copy build built rebuild " +
+  "change changes changed apply applied applying push pull commit repo git branch " +
+  "code codes line lines log logs error errors check checks verify fix fixes " +
+  "部署 上线 发布 重启 启动 停止 生产 线上 服务 更新 同步 构建 提交 代码 日志 错误 检查 修复 状态 进程")
+  .split(/\s+/)) {
+  STOP.add(w);
+}
+
+// Text a skill is matched on, minus the parts that are infrastructure trivia
+// rather than subject matter. A SKILL.md description routinely names the URL it
+// publishes to and the paths it operates on — "https://wechat.quickpapa.com",
+// "/data/coding-dev-ui/workspace/wechat", "wechat-core@main.service" — and
+// those tokenize into generic words (coding, dev, data, com, service) that
+// collide with any devops-flavoured message. Strip them before extracting
+// keywords: a skill should match on what it DOES, not on where it happens to
+// live.
+function matchableText(val) {
+  return String(val || "")
+    .replace(/```[\s\S]*?```/g, " ")      // fenced code
+    .replace(/`[^`]*`/g, " ")             // inline code
+    .replace(/https?:\/\/\S+/gi, " ")     // URLs
+    .replace(/\b[\w.@-]+\.(?:service|timer|socket|conf|json|ts|js|mjs|sh|md)\b/gi, " ") // filenames/units
+    .replace(/(?:^|\s)[~.]?\/[^\s,;:)"']*/g, " ") // absolute/relative paths
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, " ");  // IPs
+}
+
+// CJK carries no spaces, so the Latin tokenizer sees none of it — a Chinese
+// request matched nothing and a Chinese description contributed nothing. Index
+// character bigrams instead: 微信机器人 → 微信, 信机, 机器, 器人. Two-character
+// words are the norm in Chinese, so bigrams are a good unit, and the overlap
+// scoring treats them exactly like Latin stems.
+function cjkBigrams(text, into) {
+  for (const run of String(text).match(/[\u4e00-\u9fff\u3040-\u30ff]{2,}/g) || []) {
+    for (let i = 0; i + 2 <= run.length; i++) {
+      const bg = run.slice(i, i + 2);
+      if (!STOP.has(bg)) into.add(bg);
+    }
+  }
+}
+
 // Significant keyword stems for a skill, drawn from its name, description, and
 // when_to_use. Stopwords and very short tokens are dropped; plurals/conjugations
-// collapse via stem().
+// collapse via stem(); CJK contributes bigrams.
 function keywordsFor(skill) {
   const kw = new Set();
-  const addText = (val) => {
+  const addText = (val, { clean = true } = {}) => {
     if (!val) return;
-    for (const raw of String(val).toLowerCase().split(/[^a-z0-9]+/)) {
+    const text = clean ? matchableText(val) : String(val);
+    cjkBigrams(text, kw);
+    for (const raw of text.toLowerCase().split(/[^a-z0-9]+/)) {
       if (raw.length < 3) continue;
       if (STOP.has(raw)) continue;
       const s = stem(raw);
@@ -925,44 +976,84 @@ function keywordsFor(skill) {
       kw.add(s);
     }
   };
-  addText(skill.name);
+  // The name is the skill's own identifier — keep it verbatim (no path/URL
+  // stripping), it is the one place a mention is always intentional.
+  addText(skill.name, { clean: false });
   addText(skill.description);
   addText(skill.whenToUse);
   return kw;
 }
 
+// Keywords the user's message carries, in the same vocabulary as keywordsFor().
+// Only code is stripped here — URLs and paths are NOT, unlike the skill side:
+// a host or path the user types is usually the subject ("is
+// wechat.quickpapa.com up?"), it is only noise when a skill's own description
+// mentions where it deploys to. The tokenizer splits hostnames into their
+// words, so the host contributes "wechat" without contributing "com" (a
+// stopword-length token).
+function keywordsOfMessage(text) {
+  const clean = String(text || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]*`/g, " ");
+  const words = new Set();
+  cjkBigrams(clean, words);
+  for (const raw of clean.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (!raw) continue;
+    words.add(stem(raw));
+  }
+  return words;
+}
+
 // Pick the single skill whose keywords best overlap the user's text.
-// Conservative by design (a false injection derails the answer; a missed one
+// Conservative by design (a false injection derails the answer — it prepends
+// a whole SKILL.md to a request that has nothing to do with it; a missed one
 // just means the user types /name):
 //   - never inject for slash commands (let the CLI handle /name)
 //   - skip skills with no body or disable-model-invocation: true
 //   - score = number of the skill's keyword stems present in the message
 //   - require score >= 2 (two significant keywords, e.g. "merge" + "pdf")
+//   - require at least one DISTINCTIVE hit: a keyword no other installed skill
+//     claims. Without this, generic devops vocabulary every skill shares
+//     ("deploy", "production", "restart", "service") was enough to inject a
+//     specific skill into unrelated work — e.g. "deploy all to production" and
+//     even "check the error on coding.zaymuc.com" pulled in a WeChat-bot
+//     publishing skill. The subject has to show up, not just the verb.
 //   - on a tie, only inject if the winner is the workspace skill beating a
 //     global one (workspace wins by precedence); otherwise ambiguous -> none
 export function pickSkill(text, skills) {
   if (typeof text !== "string" || !text.trim() || text.trim().startsWith("/")) return null;
-  const userWords = new Set();
-  for (const raw of text.toLowerCase().split(/[^a-z0-9]+/)) {
-    if (!raw) continue;
-    userWords.add(stem(raw));
+  const userWords = keywordsOfMessage(text);
+  const usable = skills.filter((s) => !s.disableModelInvocation && s.body && s.body.trim());
+  // Document frequency across the installed set: a keyword several skills share
+  // is vocabulary, not identity.
+  const df = new Map();
+  const kwByName = new Map();
+  for (const s of usable) {
+    const kw = keywordsFor(s);
+    kwByName.set(s.name, kw);
+    for (const k of kw) df.set(k, (df.get(k) || 0) + 1);
   }
   const scored = [];
-  for (const s of skills) {
-    if (s.disableModelInvocation) continue;
-    if (!s.body || !s.body.trim()) continue;
+  for (const s of usable) {
     let score = 0;
-    for (const k of keywordsFor(s)) if (userWords.has(k)) score += 1;
-    if (score > 0) scored.push({ s, score });
+    let distinctive = 0;
+    for (const k of kwByName.get(s.name)) {
+      if (!userWords.has(k)) continue;
+      score += 1;
+      if (df.get(k) === 1) distinctive += 1;
+    }
+    if (score > 0) scored.push({ s, score, distinctive });
   }
   if (!scored.length) return null;
   scored.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
+    if (b.distinctive !== a.distinctive) return b.distinctive - a.distinctive;
     if (a.s.scope !== b.s.scope) return a.s.scope === "workspace" ? -1 : 1;
     return b.s.name.length - a.s.name.length;
   });
   const top = scored[0];
   if (top.score < 2) return null;
+  if (!top.distinctive) return null;
   if (scored.length > 1 && scored[1].score === top.score) {
     if (!(top.s.scope === "workspace" && scored[1].s.scope === "global")) return null;
   }
