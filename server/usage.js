@@ -31,9 +31,11 @@
 //
 // Tokens are read from each official CLI's credential file and never leave
 // this module (nothing token-shaped is returned to the client). Expired
-// credentials are reported as `stale` rather than refreshed: the CLIs rotate
-// their own refresh tokens, and racing them risks invalidating a working
-// login.
+// claude/codex credentials are reported as `stale` rather than refreshed.
+// Grok's OIDC access token lives only 6h and the CLI refreshes it lazily on
+// its next session, so an untouched install is almost always stale when the
+// panel looks — there we do the CLI's own silent refresh ourselves
+// (grokAuthFresh below) and rotate the persisted tokens back.
 //
 // Beside the provider quotas, `ledger()` aggregates what WE actually spent, by
 // scanning the Claude Code transcripts (~/.claude/projects/**/*.jsonl) that
@@ -41,7 +43,7 @@
 // all gateway models) carry `message.usage` natively; codex.js/grok.js append
 // a `{type:"usage"}` sidecar record per turn (loadHistory ignores unknown
 // record types) so their turns land in the same ledger.
-import { readFileSync, statSync, readdirSync, createReadStream } from "node:fs";
+import { readFileSync, statSync, readdirSync, createReadStream, writeFileSync, renameSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -412,6 +414,98 @@ function grokAuth() {
   return entries[0];
 }
 
+function grokAuthFreshMs(entry) {
+  const fromField = entry.expires_at ? new Date(entry.expires_at).getTime() : NaN;
+  return Number.isFinite(fromField) ? fromField : jwtExpiryMs(entry.key) || 0;
+}
+
+// grokAuth() plus a silent OAuth refresh when the access token is past its
+// 6h life. The CLI refreshes lazily on its next session; this keeps the usage
+// panel from going "stale" for hours after the last grok turn. Same grant the
+// CLI uses (grant_type=refresh_token, public client, no secret), and the
+// rotated tokens are written back so the CLI's own refresh keeps working.
+//
+// Safety: one refresh at a time (module-level promise); the write re-reads
+// auth.json first and only touches the entry whose refresh_token we spent, so
+// a CLI refresh that landed in between is never clobbered; on invalid_grant
+// we re-read the file (the CLI may have just rotated it) before giving up.
+let grokRefreshInflight = null;
+
+function grokRefresh(entry) {
+  const issuer = String(entry.oidc_issuer || "").replace(/\/+$/, "");
+  const { oidc_client_id: clientId, refresh_token: refreshToken } = entry;
+  if (!issuer || !clientId || !refreshToken) throw new Error("no refresh_token on file — run `grok login`");
+  return (async () => {
+    const endpoint = await cached(`grok:discovery:${issuer}`, 60 * 60 * 1000, async () => {
+      const { res, json } = await fetchJson(`${issuer}/.well-known/openid-configuration`, { timeout: 8000 });
+      return { value: res.ok && json?.token_endpoint ? json.token_endpoint : `${issuer}/oauth2/token` };
+    });
+    const { res, json, text } = await fetchJson(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+      body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, refresh_token: refreshToken }).toString(),
+      timeout: 15000,
+    });
+    if (!res.ok || !json?.access_token) throw new Error(`refresh ${res.status}: ${(text || "").slice(0, 160)}`);
+    // Persist the rotated pair. Re-read first — the CLI may have refreshed
+    // concurrently (then our refresh_token is gone from disk: skip the write).
+    const path = join(homedir(), ".grok", "auth.json");
+    const onDisk = readJson(path);
+    let wrote = false;
+    if (onDisk && typeof onDisk === "object") {
+      const now = new Date();
+      for (const v of Object.values(onDisk)) {
+        if (v?.refresh_token !== refreshToken) continue;
+        v.key = json.access_token;
+        v.refresh_token = json.refresh_token || refreshToken;
+        v.create_time = now.toISOString();
+        v.expires_at = new Date(now.getTime() + (json.expires_in || 21600) * 1000).toISOString();
+        wrote = true;
+      }
+      if (wrote) {
+        try {
+          writeFileSync(path + ".tmp", JSON.stringify(onDisk) + "\n");
+          renameSync(path + ".tmp", path);
+        } catch {
+          /* best-effort — the fresh token still serves this request */
+        }
+      }
+    }
+    // Whatever is on disk now is authoritative: our own write, the CLI's, or
+    // (nothing changed) the entry we started from. If the CLI raced us to a
+    // fresh token, use that instead of ours.
+    // A successful refresh invalidates any negative results the panel cached
+    // against the dead token (the 401 "stale" is held 60s).
+    cache.delete("grok:billing");
+    cache.delete("grok:probe");
+    const reread = grokAuth();
+    if (reread && grokAuthFreshMs(reread) > Date.now() + 60_000) return { entry: reread, refreshed: true, error: null };
+    return {
+      entry: wrote || !reread ? { ...entry, key: json.access_token, expires_at: new Date(Date.now() + (json.expires_in || 21600) * 1000).toISOString() } : reread,
+      refreshed: true,
+      error: null,
+    };
+  })().catch((err) => {
+    // invalid_grant (or any failure): the CLI may have rotated the token
+    // underneath us — re-read before surfacing the error.
+    const reread = grokAuth();
+    if (reread && grokAuthFreshMs(reread) > Date.now() + 60_000) return { entry: reread, refreshed: false, error: null };
+    throw err;
+  });
+}
+
+// grokAuth() with a refresh when stale. Resolves null when not signed in;
+// the error field carries the refresh failure for the provider notes.
+function grokAuthFresh() {
+  const auth = grokAuth();
+  if (!auth) return Promise.resolve({ entry: null, error: null, refreshed: false });
+  if (grokAuthFreshMs(auth) > Date.now() + 60_000) return Promise.resolve({ entry: auth, error: null, refreshed: false });
+  grokRefreshInflight ??= grokRefresh(auth).finally(() => {
+    grokRefreshInflight = null;
+  });
+  return grokRefreshInflight;
+}
+
 // Same trick as claude's probe: the weekly token/request allowance is only
 // reported as x-ratelimit-* headers on a completion response.
 async function grokHeaderProbe(token) {
@@ -451,12 +545,13 @@ async function grokProvider({ probe }) {
     detail: "grok-* via the official Grok Build CLI",
     source: "cli-chat-proxy.grok.com",
   };
-  const auth = grokAuth();
+  let { entry: auth, error: refreshError } = await grokAuthFresh().catch((e) => ({ entry: grokAuth(), error: String(e?.message || e) }));
   if (!auth) return { ...base, status: "unavailable", notes: ["Not signed in — run `grok login`"] };
   const token = auth.key;
-  const expired = auth.expires_at && new Date(auth.expires_at).getTime() < Date.now();
+  const expired = grokAuthFreshMs(auth) <= Date.now() + 60_000;
   const notes = [];
-  if (expired) notes.push("Credentials expired — the grok CLI refreshes them on its next session; figures update after that");
+  if (refreshError) notes.push(`Token refresh failed (${refreshError}) — figures may be stale until the next grok session`);
+  else if (expired) notes.push("Credentials expired and could not be refreshed — run `grok login`");
 
   const [billing, rate] = await Promise.all([
     cached("grok:billing", 5 * 60 * 1000, async () => {
