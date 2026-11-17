@@ -45,8 +45,12 @@ function fmtReset(sec) {
   const ms = sec * 1000 - Date.now();
   const abs = new Date(sec * 1000).toLocaleString("en-GB", { hour12: false });
   if (ms <= 0) return `reset (${abs})`;
-  const h = Math.floor(ms / 3600000);
-  const m = Math.round((ms % 3600000) / 60000);
+  let h = Math.floor(ms / 3600000);
+  let m = Math.round((ms % 3600000) / 60000);
+  if (m === 60) {
+    h += 1;
+    m = 0;
+  }
   return `resets in ${h > 0 ? `${h}h ` : ""}${m}m (${abs})`;
 }
 
@@ -63,15 +67,22 @@ function QuotaBar({ w }) {
   const pct = typeof w.usedPercent === "number" ? Math.max(0, Math.min(100, w.usedPercent)) : null;
   const lvl = levelOf(pct);
   const reset = fmtReset(w.resetAt);
+  // Whole percent, like the official UIs: Claude Code renders
+  // `Math.floor(utilization)% used` and the codex CLI shows "primary 12%".
+  // The exact figure stays in the tooltip.
+  const shown = pct == null ? null : Math.floor(pct);
   return (
     <div className="ug-win">
       <div className="ug-win-head">
         <span className="ug-win-label">{w.label}</span>
-        <span className={`ug-win-pct ${lvl}`}>
-          {pct == null ? "—" : `${pct < 1 && pct > 0 ? pct.toFixed(2) : pct.toFixed(1)}%`}
-        </span>
+        <span className={`ug-win-pct ${lvl}`}>{shown == null ? "—" : `${shown}%`}</span>
       </div>
-      <div className="ug-track" role="img" aria-label={`${w.label}: ${pct ?? "unknown"}% used`}>
+      <div
+        className="ug-track"
+        role="img"
+        aria-label={`${w.label}: ${shown == null ? "unknown" : shown}% used`}
+        title={pct == null ? undefined : `${pct.toFixed(2)}% used`}
+      >
         <div className={`ug-fill ${lvl}`} style={{ width: `${pct == null ? 0 : Math.max(pct, pct > 0 ? 1.5 : 0)}%` }} />
       </div>
       <div className="ug-win-foot">

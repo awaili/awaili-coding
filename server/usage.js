@@ -132,6 +132,35 @@ function claudeToken() {
   return creds?.claudeAiOauth?.accessToken || "";
 }
 
+// Map the unified rate-limit response headers onto the window rows the panel
+// renders. `get` is a header lookup, so this stays pure and testable without
+// touching the API.
+//
+// The utilization headers carry a FRACTION (0..1), not a percentage. Claude
+// Code scales them before rendering ("26% used"): its header parser keeps the
+// raw fraction and the usage view multiplies by 100 (`utilization:
+// o.utilization*100`, then `Math.floor(pl)% used`). Reading them as
+// percentages showed "0.26%" here while the CLI and claude.ai show "26% used"
+// — hence the *100 below.
+export function unifiedWindows(get) {
+  const num = (name) => {
+    const v = get(name);
+    const n = v == null ? NaN : Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const pct = (name) => {
+    const v = num(name);
+    return v === null ? null : v * 100;
+  };
+  return [
+    // Same titles the official CLI / claude.ai use, so the figures can be
+    // compared line by line: the 5h rolling window is "Current session",
+    // the weekly window is "Current week (all models)".
+    { id: "5h", label: "Current session", usedPercent: pct("anthropic-ratelimit-unified-5h-utilization"), resetAt: num("anthropic-ratelimit-unified-5h-reset"), state: get("anthropic-ratelimit-unified-5h-status") },
+    { id: "7d", label: "Current week (all models)", usedPercent: pct("anthropic-ratelimit-unified-7d-utilization"), resetAt: num("anthropic-ratelimit-unified-7d-reset"), state: get("anthropic-ratelimit-unified-7d-status") },
+  ].filter((w) => w.usedPercent !== null || w.state);
+}
+
 // One-token /v1/messages call purely to read the unified rate-limit headers.
 // ~22 input tokens per probe, cached, so it's noise against any plan.
 async function claudeHeaderProbe(token) {
@@ -156,11 +185,6 @@ async function claudeHeaderProbe(token) {
     signal: AbortSignal.timeout(30000),
   });
   const h = (name) => res.headers.get(name);
-  const num = (name) => {
-    const v = h(name);
-    const n = v == null ? NaN : Number(v);
-    return Number.isFinite(n) ? n : null;
-  };
   if (!res.ok && !h("anthropic-ratelimit-unified-status")) {
     const body = await res.text();
     throw new Error(`probe ${res.status}: ${body.slice(0, 160)}`);
@@ -168,12 +192,10 @@ async function claudeHeaderProbe(token) {
   await res.arrayBuffer().catch(() => {});
   return {
     limitStatus: h("anthropic-ratelimit-unified-status"),
-    windows: [
-      { id: "5h", label: "5 hours", usedPercent: num("anthropic-ratelimit-unified-5h-utilization"), resetAt: num("anthropic-ratelimit-unified-5h-reset"), state: h("anthropic-ratelimit-unified-5h-status") },
-      { id: "7d", label: "7 days", usedPercent: num("anthropic-ratelimit-unified-7d-utilization"), resetAt: num("anthropic-ratelimit-unified-7d-reset"), state: h("anthropic-ratelimit-unified-7d-status") },
-    ].filter((w) => w.usedPercent !== null || w.state),
+    windows: unifiedWindows(h),
     fallback: h("anthropic-ratelimit-unified-fallback"),
     overageStatus: h("anthropic-ratelimit-unified-overage-status"),
+    overageDisabledReason: h("anthropic-ratelimit-unified-overage-disabled-reason"),
     representativeClaim: h("anthropic-ratelimit-unified-representative-claim"),
   };
 }
@@ -234,11 +256,35 @@ async function claudeProvider({ probe }) {
       `Official /api/oauth/usage is rate-limited (retry in ~${Math.round(oauthRes.retryAfterSec / 60)} min); window figures come from the response headers instead`,
     );
   }
+  if (oauthRes?.status === "error") {
+    // A setup-token lacks the `user:profile` scope, so the account usage API
+    // is unreachable. Claude Code hits the same wall and falls back to the
+    // rate-limit headers — which is where these numbers come from, so they
+    // still match the official site.
+    const scopeIssue = /scope/i.test(String(oauthRes.error || ""));
+    notes.push(
+      scopeIssue
+        ? "Official /api/oauth/usage needs a token with the user:profile scope, which this setup-token does not have — the windows below come from the rate-limit headers instead, the same source Claude Code and claude.ai read"
+        : `Official /api/oauth/usage is unavailable (${oauthRes.error}) — the windows below come from the rate-limit headers instead, the same source Claude Code and claude.ai read`,
+    );
+  }
   if (headerRes?.status === "skipped") notes.push("Not probed (probe=0) — hit Refresh for current window utilization");
   if (headerRes?.status === "error") notes.push(`Probe failed: ${headerRes.error}`);
   if (expiry) notes.push(`Subscription token valid until ${new Date(expiry).toISOString().slice(0, 10)}`);
 
   const windows = headerRes?.windows || [];
+  // "rejected" here means overage / usage credits are NOT available for this
+  // account — printing a bare "rejected" reads like the account itself was
+  // rejected, so spell it out.
+  const overageFact = headerRes?.overageStatus
+    ? {
+        label: "Usage credits (overage)",
+        value:
+          headerRes.overageStatus === "rejected" && headerRes.overageDisabledReason
+            ? `not available (${headerRes.overageDisabledReason.replace(/_/g, " ")})`
+            : headerRes.overageStatus,
+      }
+    : null;
   return {
     ...base,
     status: headerRes?.status === "ok" ? "ok" : headerRes?.status === "skipped" ? "stale" : "error",
@@ -246,7 +292,7 @@ async function claudeProvider({ probe }) {
     windows,
     facts: [
       headerRes?.limitStatus ? { label: "Limit status", value: headerRes.limitStatus } : null,
-      headerRes?.overageStatus ? { label: "Overage", value: headerRes.overageStatus } : null,
+      overageFact,
       headerRes?.fallback ? { label: "Fallback model", value: headerRes.fallback } : null,
     ].filter(Boolean),
     extra: oauthRes?.status === "ok" ? oauthRes.data : null,
@@ -291,11 +337,20 @@ async function codexProvider() {
   }
   const d = result.data || {};
   const rl = d.rate_limit || {};
+  // The API calls these primary/secondary; the codex CLI calls them the
+  // "5-hour limit" and the "weekly limit". Label them the way codex does.
+  const windowLabel = (secs) => {
+    if (!secs) return null;
+    const h = Math.round(secs / 3600);
+    if (h >= 160) return "Weekly limit";
+    if (h >= 4 && h <= 6) return "5-hour limit";
+    return `${h}h limit`;
+  };
   const mkWindow = (w, id, label) =>
     w
       ? {
           id,
-          label: w.limit_window_seconds ? `${label} (${Math.round(w.limit_window_seconds / 3600)}h)` : label,
+          label: windowLabel(w.limit_window_seconds) || label,
           usedPercent: typeof w.used_percent === "number" ? w.used_percent : null,
           resetAt: w.reset_at || (w.reset_after_seconds ? Math.floor(Date.now() / 1000) + w.reset_after_seconds : null),
         }

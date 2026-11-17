@@ -9,6 +9,10 @@
 // grok.js append, and the per-file memoization that must still notice a
 // transcript that grew.
 //
+// The one exception is unifiedWindows(): the mapping from Anthropic's unified
+// rate-limit headers to the panel's window rows. It is pure, and the scale of
+// its utilization header is easy to get wrong — see the test below.
+//
 // Run: npm test
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -149,4 +153,41 @@ test("byDay carries one bucket per calendar day, newest last", async () => {
   assert.ok(dates.includes(yesterday) && dates.includes(today));
   assert.equal(led.byDay.find((d) => d.date === yesterday).total, 440);
   assert.equal(led.today.turns, 5, "yesterday's turn is not in today's bucket");
+});
+
+// The unified rate-limit headers report utilization as a FRACTION (0..1).
+// Claude Code multiplies by 100 before printing "26% used" (its header parser
+// keeps the raw fraction; the usage view does `utilization * 100` then
+// `Math.floor(...)% used`). Treating the raw fraction as a percentage made the
+// panel read "0.26%" where the CLI and claude.ai read "26% used" — the whole
+// reason the panel's numbers did not match the official site.
+test("unified utilization headers are fractions and render as percent", () => {
+  const headers = {
+    "anthropic-ratelimit-unified-5h-utilization": "0.0",
+    "anthropic-ratelimit-unified-5h-reset": "1794894000",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-7d-utilization": "0.26",
+    "anthropic-ratelimit-unified-7d-reset": "1795158000",
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+  };
+  const wins = usage.unifiedWindows((name) => headers[name] ?? null);
+  assert.equal(wins.length, 2);
+  const session = wins.find((w) => w.id === "5h");
+  const week = wins.find((w) => w.id === "7d");
+  assert.equal(session.usedPercent, 0, "a 0.0 fraction is 0% used");
+  assert.equal(week.usedPercent, 26, "a 0.26 fraction is 26% used, not 0.26%");
+  assert.equal(session.label, "Current session", "the 5h window is the session window");
+  assert.equal(week.label, "Current week (all models)");
+  assert.equal(session.resetAt, 1794894000, "the reset header is a unix timestamp in seconds");
+  assert.equal(session.state, "allowed");
+});
+
+test("a utilization header of 0.5 is 50% used, and missing headers drop the window", () => {
+  const wins = usage.unifiedWindows((name) =>
+    name === "anthropic-ratelimit-unified-7d-utilization" ? "0.5" : null,
+  );
+  assert.equal(wins.length, 1);
+  assert.equal(wins[0].id, "7d");
+  assert.equal(wins[0].usedPercent, 50);
+  assert.equal(usage.unifiedWindows(() => null).length, 0);
 });
