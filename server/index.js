@@ -12,6 +12,7 @@ import filesRouter from "./files.js";
 import skillsRouter from "./skills.js";
 import { confineCwd } from "./util.js";
 import { readTranscriptImage } from "./transcript.js";
+import { sessionArtifacts, artifactsZip } from "./artifacts.js";
 import { getUsage, clearUsageCache } from "./usage.js";
 import {
   requireAuth,
@@ -160,6 +161,38 @@ app.get("/api/transcript/image", async (req, res) => {
   res.setHeader("Content-Type", img.mediaType);
   res.setHeader("Cache-Control", "private, max-age=3600");
   res.send(img.buffer);
+});
+
+// Session artifact index: the workspace files a session's Edit/Write/
+// MultiEdit/NotebookEdit calls touched (aggregated from the transcript), plus
+// a zip of those still-existing files for one-click download. cwd/session are
+// validated the same way as /api/transcript/image — they're joined into a
+// path under ~/.claude/projects.
+app.get("/api/artifacts", async (req, res) => {
+  const cwd = confineCwd(String(req.query.cwd || ""));
+  const session = String(req.query.session || "");
+  if (!cwd || !ID_RE.test(session)) return res.status(400).json({ error: "missing or invalid cwd or session" });
+  try {
+    const items = await sessionArtifacts(cwd, session);
+    res.json({ items });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) });
+  }
+});
+
+app.get("/api/artifacts/zip", async (req, res) => {
+  const cwd = confineCwd(String(req.query.cwd || ""));
+  const session = String(req.query.session || "");
+  if (!cwd || !ID_RE.test(session)) return res.status(400).json({ error: "missing or invalid cwd or session" });
+  try {
+    const z = await artifactsZip(cwd, session);
+    if (!z) return res.status(404).json({ error: "no downloadable artifacts for this session" });
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${z.name}"`);
+    res.send(z.buffer);
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) });
+  }
 });
 
 // Health/diagnostics. NEVER spread `config` here — it carries authSecret (the

@@ -23,6 +23,12 @@ import GUIDE from "./skill-guide.md?raw";
 
 const MD_RE = /\.(md|markdown|mdx)$/i;
 
+// Chip text cap — long allowedTools / argumentHint values get truncated with
+// the full text in the title tooltip instead of blowing out the 260px list.
+function trunc(t, n = 26) {
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+
 function qs(scope, cwd, skill, path) {
   const p = new URLSearchParams();
   p.set("scope", scope);
@@ -69,6 +75,12 @@ export default function Skills({ cwd, workspaceRoot, onClose }) {
   // "" for the current directory zone.
   const [dragPath, setDragPath] = useState(null);
   const [dropOver, setDropOver] = useState(null);
+  // --- Manage tab: "Test triggers" panel state ---
+  const [testOpen, setTestOpen] = useState(false);
+  const [testMsg, setTestMsg] = useState("");
+  const [testBusy, setTestBusy] = useState(false);
+  const [testResult, setTestResult] = useState(null); // {message, injected, ranked}
+  const [testError, setTestError] = useState(null);
   const noteTimer = useRef(null);
 
   // --- Browse tab state ---
@@ -275,6 +287,83 @@ export default function Skills({ cwd, workspaceRoot, onClose }) {
       refreshSkills(scope);
     } catch (e) {
       window.alert(String(e));
+    }
+  }
+
+  // Flip a skill's auto-injection on/off (the disable-model-invocation
+  // frontmatter). Manual /<name> invocation keeps working either way.
+  async function toggleAuto(s) {
+    try {
+      const r = await fetch("/api/skills/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // autoInvocation=false means injection is disabled, so toggling
+        // inverts into the `disabled` flag the API expects.
+        body: JSON.stringify({ scope, cwd, name: s.name, disabled: !!s.autoInvocation }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.error) {
+        window.alert(j.error || `toggle failed (HTTP ${r.status})`);
+        return;
+      }
+      refreshSkills(scope);
+    } catch (e) {
+      window.alert(String(e));
+    }
+  }
+
+  // Rename a skill (also renames its /<name> command). Optionally migrate it
+  // to the other scope in the same call (global <-> workspace).
+  async function renameSkill(s) {
+    const toName = window.prompt(`Rename skill "${s.name}" to (the /<name> command changes too):`, s.name);
+    if (!toName || toName === s.name) return;
+    const move = window.confirm("Also move to the other scope (global↔workspace)?");
+    const toScope = move ? (scope === "global" ? "workspace" : "global") : scope;
+    try {
+      const r = await fetch("/api/skills/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope, cwd, name: s.name, toName, toScope }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.error) {
+        window.alert(j.error || `rename failed (HTTP ${r.status})`);
+        return;
+      }
+      // Follow the selection: stay on the renamed skill in the same scope,
+      // or drop the selection if it moved to the other scope's list.
+      if (selSkill === s.name) {
+        if (toScope === scope) setSelSkill(toName);
+        else { setSelSkill(null); setScope(toScope); }
+      }
+      refreshSkills(scope);
+      flash(`renamed to ${toName}${toScope !== scope ? ` (${toScope})` : ""}`);
+    } catch (e) {
+      window.alert(String(e));
+    }
+  }
+
+  // Probe the backend's trigger ranking with a sample message. `injected` is
+  // what pickSkill would really inject; `ranked` is the scored shortlist.
+  async function runTest() {
+    const message = testMsg.trim();
+    if (!message || testBusy) return;
+    setTestBusy(true);
+    setTestError(null);
+    try {
+      const r = await fetch("/api/skills/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, message }),
+      });
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+      setTestResult(j);
+    } catch (e) {
+      setTestError(e.message);
+      setTestResult(null);
+    } finally {
+      setTestBusy(false);
     }
   }
 
@@ -759,6 +848,7 @@ export default function Skills({ cwd, workspaceRoot, onClose }) {
         {error && <div className="skills-error">{error}</div>}
 
         {tab === "manage" && (
+          <>
           <div className="skills-split">
             {/* Left: skill list */}
             <div className="skills-list">
@@ -795,24 +885,61 @@ export default function Skills({ cwd, workspaceRoot, onClose }) {
                   )}
                 </div>
               )}
-              {skills.map((s) => (
-                <div
-                  key={s.name}
-                  className={"skills-item" + (s.name === selSkill ? " active" : "")}
-                  onClick={() => setSelSkill(s.name)}
-                  title={s.description}
-                >
-                  <div className="skills-item-row">
-                    <span className="skills-name">{s.name}</span>
-                    <button
-                      className="skills-rm"
-                      title="Delete skill"
-                      onClick={(e) => { e.stopPropagation(); removeSkill(s.name); }}
-                    >✕</button>
+              {skills.map((s) => {
+                // allowedTools may arrive as a string or an array — normalize
+                // for chip display, with the full value in the tooltip.
+                const tools = Array.isArray(s.allowedTools) ? s.allowedTools.join(", ") : (s.allowedTools || "");
+                return (
+                  <div
+                    key={s.name}
+                    className={"skills-item" + (s.name === selSkill ? " active" : "")}
+                    onClick={() => setSelSkill(s.name)}
+                    title={s.description}
+                  >
+                    <div className="skills-item-row">
+                      <span className="skills-name">{s.name}</span>
+                      <button
+                        className={"skills-act skills-auto " + (s.autoInvocation ? "on" : "off")}
+                        title="Auto-injection on new messages; manual /name always works"
+                        onClick={(e) => { e.stopPropagation(); toggleAuto(s); }}
+                      >{s.autoInvocation ? "◉" : "○"}</button>
+                      {/* Plain link so the browser streams the zip itself. */}
+                      <a
+                        className="skills-act"
+                        href={`/api/skills/export?scope=${encodeURIComponent(scope)}${scope === "workspace" && cwd ? `&cwd=${encodeURIComponent(cwd)}` : ""}&name=${encodeURIComponent(s.name)}`}
+                        download={`${s.name}.zip`}
+                        title="Export this skill as a .zip"
+                        onClick={(e) => e.stopPropagation()}
+                      >⬇</a>
+                      <button
+                        className="skills-act"
+                        title="Rename skill (also renames the /<name> command)"
+                        onClick={(e) => { e.stopPropagation(); renameSkill(s); }}
+                      >✎</button>
+                      <button
+                        className="skills-rm"
+                        title="Delete skill"
+                        onClick={(e) => { e.stopPropagation(); removeSkill(s.name); }}
+                      >✕</button>
+                    </div>
+                    <div className="skills-desc">{s.description}</div>
+                    <div className="skills-chips">
+                      {!s.autoInvocation && (
+                        <span className="skills-badge warn" title="Auto-injection is disabled; invoke manually via /<name>">manual-only</span>
+                      )}
+                      {s.userInvocable === false && (
+                        <span className="skills-badge err" title="Not user-invocable — the /<name> command is hidden">hidden</span>
+                      )}
+                      {tools && (
+                        <span className="skills-badge muted" title={`allowed tools: ${tools}`}>tools: {trunc(tools)}</span>
+                      )}
+                      {s.argumentHint && (
+                        <span className="skills-badge muted" title={`argument hint: ${s.argumentHint}`}>arg: {trunc(s.argumentHint, 20)}</span>
+                      )}
+                    </div>
                   </div>
-                  <div className="skills-desc">{s.description}</div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             {/* Right: file browser + editor for the selected skill */}
@@ -899,6 +1026,77 @@ export default function Skills({ cwd, workspaceRoot, onClose }) {
               )}
             </div>
           </div>
+
+          {/* Test triggers: probe the injection ranking with a sample message.
+              Collapsed by default so it never steals space from the editor. */}
+          <div className="skills-test">
+            <div className="skills-test-head" onClick={() => setTestOpen(!testOpen)}>
+              <span>Test triggers</span>
+              <span className="skills-subhead-hint">see which skill a message would inject</span>
+              <span className="spacer" />
+              <span>{testOpen ? "▾" : "▸"}</span>
+            </div>
+            {testOpen && (
+              <div className="skills-test-body">
+                <div className="skills-test-row">
+                  <input
+                    type="text"
+                    placeholder="Type a message, e.g. 'deploy the site'…"
+                    value={testMsg}
+                    onChange={(e) => setTestMsg(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && runTest()}
+                  />
+                  <button onClick={runTest} disabled={testBusy || !testMsg.trim()}>
+                    {testBusy ? "Testing…" : "Test"}
+                  </button>
+                </div>
+                {testError && <div className="skills-test-error">{testError}</div>}
+                {testResult && (
+                  <div className="skills-test-result">
+                    <div className={"skills-test-inject " + (testResult.injected ? "ok" : "muted")}>
+                      {testResult.injected
+                        ? <>Would inject: <b>{testResult.injected.name}</b> ({testResult.injected.scope})</>
+                        : "No skill would be injected"}
+                    </div>
+                    {(testResult.ranked || []).length === 0 ? (
+                      <div className="skills-test-empty">No skill matched any keyword</div>
+                    ) : (
+                      <table className="skills-rank">
+                        <thead>
+                          <tr><th>skill</th><th>scope</th><th>score</th><th>distinctive</th><th>matched</th></tr>
+                        </thead>
+                        <tbody>
+                          {testResult.ranked.map((r) => {
+                            const picked = testResult.injected &&
+                              r.name === testResult.injected.name && r.scope === testResult.injected.scope;
+                            return (
+                              <tr key={`${r.scope}/${r.name}`} className={picked ? "picked" : ""}>
+                                <td className="skills-rank-name">
+                                  {r.name}
+                                  {r.disabled && (
+                                    <span className="skills-badge err" title="Auto-injection disabled — cannot be picked">disabled</span>
+                                  )}
+                                </td>
+                                <td>{r.scope}</td>
+                                <td>{typeof r.score === "number" ? r.score.toFixed(2) : r.score}</td>
+                                <td>{r.distinctive ? "yes" : "—"}</td>
+                                <td className="skills-rank-matched">
+                                  {(r.matched || []).map((k) => (
+                                    <span key={k} className="skills-badge muted">{k}</span>
+                                  ))}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          </>
         )}
 
         {tab === "browse" && (

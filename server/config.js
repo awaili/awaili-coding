@@ -167,6 +167,28 @@ export const config = {
   // (not busy) longer than idleTimeoutMs. The map entry is kept so the
   // session resumes seamlessly on next open (ws.js's subscribe handler
   // restarts it via --resume and replays on-disk history). 0 disables.
+  // Per-model context-window sizes (tokens), used by the context gauge and the
+  // context-high warning. Comma-separated `<prefix>=<tokens>` rules, first
+  // matching prefix wins (same semantics as modelRoutes). The model's real
+  // window is only reported in API responses we don't see, so this is a
+  // declared approximation — set CONTEXT_WINDOWS to correct it per model
+  // family, e.g. "glm-=128000,gpt-5=272000,claude-=200000".
+  contextWindows: (process.env.CONTEXT_WINDOWS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((rule) => {
+      const eq = rule.indexOf("=");
+      if (eq < 0) return null;
+      const tokens = Number(rule.slice(eq + 1));
+      if (!Number.isFinite(tokens) || tokens <= 0) return null;
+      return { prefix: rule.slice(0, eq).trim(), tokens: Math.floor(tokens) };
+    })
+    .filter(Boolean),
+  defaultContextWindow: Number(process.env.DEFAULT_CONTEXT_WINDOW) || 200000,
+  // Fraction of the context window at which the server emits a `context-high`
+  // event (once per crossing; re-arms after dropping below 80% of it).
+  contextHighPct: Number(process.env.CONTEXT_HIGH_PCT) || 0.75,
   idleTimeoutMs: Number(process.env.IDLE_TIMEOUT_MS) || 10 * 60 * 1000,
   // Hard cap on simultaneously-alive claude processes. Starting a new
   // session when this many are already alive LRU-stops the oldest idle one
@@ -217,4 +239,15 @@ export function routeForModel(model) {
     if (model && model.startsWith(r.prefix)) return r;
   }
   return { native: false, engine: null, baseUrl: config.anthropicBaseUrl, token: config.anthropicAuthToken };
+}
+
+// Declared context-window size for a model (see config.contextWindows). First
+// matching prefix wins; unknown models fall back to defaultContextWindow. The
+// number is an approximation the operator declares (the API responses we can
+// see don't carry the real window) — good enough for a gauge + warning.
+export function contextWindowFor(model) {
+  for (const r of config.contextWindows) {
+    if (model && model.startsWith(r.prefix)) return r.tokens;
+  }
+  return config.defaultContextWindow;
 }

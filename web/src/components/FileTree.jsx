@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, Fragment } from "react";
+import { useEffect, useState, useCallback, useRef, Fragment } from "react";
 
 // File browser for the right panel, rendered as a lazy expand/collapse tree:
 // click a folder's ▸ twisty (or its row) to reveal its contents inline rather
@@ -10,7 +10,12 @@ import { useEffect, useState, useCallback, Fragment } from "react";
 // onMoveFile so the parent can close or follow the editor if the affected path
 // was open. Drag a file/folder onto a folder (or the empty area for the root)
 // to move it.
-export default function FileTree({ cwd, onOpenFile, onDeleteFile, onMoveFile, activePath }) {
+//
+// `fsVersion` is a bump counter the parent raises on every `fs-changed` WS
+// event (a session's tools wrote workspace files); whenever it moves, every
+// already-loaded folder re-fetches, so agentic edits appear without a manual
+// Refresh while open folders stay expanded.
+export default function FileTree({ cwd, onOpenFile, onDeleteFile, onMoveFile, activePath, fsVersion }) {
   // Tree cache keyed by rel path: "" is the workspace root. Each entry holds the
   // one-level listing plus loaded/expanded/loading flags. Centralizing it (vs.
   // per-node component state) lets a move/delete refresh exactly the affected
@@ -47,6 +52,21 @@ export default function FileTree({ cwd, onOpenFile, onDeleteFile, onMoveFile, ac
     setLoading(true);
     loadNode("").finally(() => setLoading(false));
   }, [loadNode]);
+
+  // Follow agentic writes: the parent bumps fsVersion on every `fs-changed`
+  // event. Re-fetch every loaded folder (collapsed ones too — they should be
+  // correct when expanded later). loadNode keeps each folder's expanded flag,
+  // so nothing visually collapses on refresh. Skip the initial mount bump
+  // (fsVersion 0) — the workspace-change effect above already loads the root.
+  const fsVersionRef = useRef(0);
+  useEffect(() => {
+    if (fsVersion === fsVersionRef.current) return;
+    fsVersionRef.current = fsVersion;
+    setNodes((prev) => {
+      for (const [p, n] of Object.entries(prev)) if (n.loaded) loadNode(p);
+      return prev;
+    });
+  }, [fsVersion, loadNode]);
 
   async function onToggle(item) {
     if (!item.dir) return;
@@ -189,6 +209,34 @@ export default function FileTree({ cwd, onOpenFile, onDeleteFile, onMoveFile, ac
     setDropOver(null);
   }
 
+  // Binary upload into the workspace (POST /api/files/upload). The hidden
+  // input sits next to the tree footer; uploading under a specific folder
+  // could be added later, but everything the tree offers today starts at the
+  // root and this matches the download button's simplicity. The File is sent
+  // as the raw request body (PUT /api/files would base64-wrap it in JSON).
+  const uploadInputRef = useRef(null);
+  async function onUploadPicked(e) {
+    const f = e.target.files?.[0];
+    e.target.value = ""; // allow picking the same file again later
+    if (!f) return;
+    const path = f.name.replace(/[\\/]/g, "_"); // never let a filename escape the root
+    setBusy(path);
+    try {
+      const res = await fetch(
+        `/api/files/upload?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}`,
+        { method: "POST", body: f },
+      );
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j.error) {
+        window.alert(j.error || `upload failed (HTTP ${res.status})`);
+        return;
+      }
+      refresh("");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   // Refresh every currently-loaded folder (picks up external changes).
   function refreshAll() {
     for (const p of Object.keys(nodes)) if (nodes[p]?.loaded) loadNode(p);
@@ -276,6 +324,14 @@ export default function FileTree({ cwd, onOpenFile, onDeleteFile, onMoveFile, ac
       )}
       <div style={{ marginTop: 12 }}>
         <button onClick={refreshAll}>Refresh</button>
+        <input ref={uploadInputRef} type="file" style={{ display: "none" }} onChange={onUploadPicked} />
+        <button
+          onClick={() => uploadInputRef.current?.click()}
+          title="Upload a file (any type) into the workspace root"
+          style={{ marginLeft: 6 }}
+        >
+          Upload
+        </button>
       </div>
     </div>
   );

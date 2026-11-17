@@ -38,8 +38,7 @@ const CHUNK = 1 << 18; // 256 KB per read — big enough to be cheap, small enou
  * across a chunk boundary is not corrupted (the bug that garbled non-ASCII
  * content back when stdout was accumulated as a string).
  */
-async function* iterRecords(path, fromOffset = 0) {
-  let stream;
+export async function* iterRecords(path, fromOffset = 0) {  let stream;
   try {
     stream = createReadStream(path, { start: fromOffset, highWaterMark: CHUNK });
   } catch {
@@ -244,6 +243,59 @@ export async function readHistory(cwd, sessionId, opts = {}) {
   // indices are dense from 0), so hasMore is false.
   const oldestIndex = kept.length ? kept[0].idx : 0;
   return { messages: kept.map((e) => e.msg), oldestIndex, hasMore: oldestIndex > 0 };
+}
+
+// --- plain-text rendering (for compaction) -------------------------------
+
+/**
+ * Render a session's transcript as a compact plain-text conversation, for the
+ * compaction path (sessions.js): the text is handed to a one-shot `claude -p`
+ * that summarizes it into the seed message of a successor session.
+ *
+ * Tool calls become one-liners (`TOOL Edit <path>`) and tool results are
+ * dropped entirely — the summary needs to know WHAT was done, not the full
+ * output of every command. Each message is capped (perMsg chars) and the
+ * whole text is capped (maxChars) so a runaway transcript can't blow up the
+ * summarizer prompt. Returns { text, count } where count is the number of
+ * rendered messages.
+ */
+export async function readConversationText(cwd, sessionId, { maxChars = 240_000, perMsg = 6000 } = {}) {
+  const path = sessionLogPath(cwd, sessionId);
+  if (!path) return { text: "", count: 0 };
+  const parts = [];
+  let chars = 0;
+  let count = 0;
+  const push = (line) => {
+    const clipped = line.length > perMsg ? line.slice(0, perMsg) + " […truncated]" : line;
+    parts.push(clipped);
+    chars += clipped.length;
+    count += 1;
+  };
+  for await (const { rec } of iterRecords(path)) {
+    if (chars > maxChars) break;
+    if (!rec || rec.isSidechain) continue;
+    if (rec.type === "user") {
+      const content = rec.message?.content;
+      const blocks = Array.isArray(content) ? content : [];
+      if (blocks.some((b) => b && b.type === "tool_result")) continue; // results omitted
+      const userText = stripSkillInjection(
+        blocks.filter((b) => b && b.type === "text").map((b) => b.text || "").join(""),
+      );
+      if (userText.trim()) push(`USER: ${userText.trim()}`);
+    } else if (rec.type === "assistant") {
+      const blocks = Array.isArray(rec.message?.content) ? rec.message.content : [];
+      const lines = [];
+      for (const b of blocks) {
+        if (b?.type === "text" && b.text?.trim()) lines.push(b.text.trim());
+        else if (b?.type === "tool_use") {
+          const p = b.input?.file_path || b.input?.notebook_path || b.input?.pattern || b.input?.command || "";
+          lines.push(`TOOL ${b.name}${p ? ` ${String(p).slice(0, 300)}` : ""}`);
+        }
+      }
+      if (lines.length) push(`ASSISTANT: ${lines.join("\n")}`);
+    }
+  }
+  return { text: parts.join("\n\n"), count };
 }
 
 // --- image index + budget -------------------------------------------------

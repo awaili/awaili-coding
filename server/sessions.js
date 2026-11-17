@@ -1,16 +1,16 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
-import { config, childEnv, routeForModel } from "./config.js";
+import { config, childEnv, routeForModel, contextWindowFor } from "./config.js";
 import { buildClaudeArgs } from "./claude-args.js";
 import { availableSkillsForCwd, pickSkill } from "./skills.js";
 import { isVisionModel } from "./catalog.js";
 import { transcribeImages } from "./vision.js";
 import { sessionLogPath, fileToTextBlock, injectSkill, transcriptEngine } from "./util.js";
-import { readHistory, embeddedImageBytes, forgetTranscript } from "./transcript.js";
+import { readHistory, readConversationText, embeddedImageBytes, forgetTranscript } from "./transcript.js";
 import { CodexSession, codexHooks } from "./codex.js";
 import { GrokSession, grokHooks } from "./grok.js";
 
@@ -85,6 +85,9 @@ function loadState() {
         sess.title = s.title;
         sess.createdAt = s.createdAt;
         sess.metrics = s.metrics || null;
+        // Restored lastActivity keeps the sidebar's "last seen" honest across a
+        // server restart (without it every session looks just-used).
+        if (typeof s.lastActivity === "number") sess.lastActivity = s.lastActivity;
         sessions.set(s.id, sess);
       }
       // Rewrite the file without the pruned entries.
@@ -105,7 +108,7 @@ function saveStateNow() {
     clearTimeout(saveTimer);
     saveTimer = null;
   }
-  const arr = [...sessions.values()].map(({ id, cwd, title, createdAt, model, confirm, metrics }) => ({
+  const arr = [...sessions.values()].map(({ id, cwd, title, createdAt, model, confirm, metrics, lastActivity }) => ({
     id,
     cwd,
     title,
@@ -113,6 +116,7 @@ function saveStateNow() {
     model,
     confirm,
     metrics: metrics || null,
+    lastActivity: lastActivity || null,
   }));
   try {
     mkdirSync(config.workspaceRoot, { recursive: true });
@@ -136,6 +140,10 @@ function saveState() {
 // and num_turns are cumulative across the whole session (claude accumulates
 // them, so we just take its value rather than re-summing). Returns null only
 // if the event is malformed — a normal result always has usage + totals.
+// Tools whose file_path/notebook_path argument names a workspace file they
+// mutate — the sources of the `fs-changed` event and the artifact index.
+const FILE_MUTATING_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+
 function extractMetrics(evt) {
   const u = evt && evt.usage ? evt.usage : {};
   return {
@@ -143,6 +151,11 @@ function extractMetrics(evt) {
     outputTokens: u.output_tokens || 0,
     cacheReadTokens: u.cache_read_input_tokens || 0,
     cacheCreationTokens: u.cache_creation_input_tokens || 0,
+    // Approximate context occupancy after this turn: everything the model was
+    // handed (input + cache read + cache write) is what the next turn re-sends.
+    // Used by the UI's context gauge and the `context-high` warning.
+    contextTokens:
+      (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0),
     totalCostUsd: typeof evt.total_cost_usd === "number" ? evt.total_cost_usd : null,
     totalDurationMs: typeof evt.duration_ms === "number" ? evt.duration_ms : null,
     totalTurns: typeof evt.num_turns === "number" ? evt.num_turns : null,
@@ -187,6 +200,13 @@ class Session extends EventEmitter {
     // the result event, so without persisting here the metrics are lost on
     // restart and the UI has nothing to show for past sessions.
     this.metrics = null;
+    // Absolute file paths touched by file-mutating tools (Edit/Write/MultiEdit/
+    // NotebookEdit) during the CURRENT turn. Flushed as an `fs-changed` event
+    // on the turn's result so the file tree can refresh without polling.
+    this.turnFiles = [];
+    // Whether a `context-high` warning already fired for the current occupancy
+    // band (re-arms once usage drops well below the threshold).
+    this.contextWarned = false;
   }
 
   // Child env with this session's model overriding the global default. All four
@@ -370,6 +390,44 @@ class Session extends EventEmitter {
       this.metrics = extractMetrics(evt);
       saveState();
       emitStatus();
+      // Tell subscribed clients which workspace files this turn touched, so
+      // the file tree can refresh exactly the affected folders instead of
+      // polling (collected from the turn's assistant tool_use blocks below).
+      if (this.turnFiles && this.turnFiles.length) {
+        const files = [...new Set(this.turnFiles)];
+        this.turnFiles = [];
+        this.emit("event", { type: "fs-changed", sessionId: this.id, files });
+      }
+      // Context gauge warning: occupancy (input + cache of the last turn
+      // approximates the re-sent history) past the configured fraction of the
+      // model's declared window. Fires once per band crossing; the Compact
+      // button in the UI is the way out.
+      const window_ = contextWindowFor(this.model);
+      const used = this.metrics.contextTokens || 0;
+      const pct = used / window_;
+      if (pct >= config.contextHighPct && !this.contextWarned) {
+        this.contextWarned = true;
+        this.emit("event", {
+          type: "context-high",
+          sessionId: this.id,
+          used,
+          window: window_,
+          pct,
+        });
+      } else if (pct < config.contextHighPct * 0.8) {
+        this.contextWarned = false;
+      }
+    }
+    // Collect file-mutating tool calls for the `fs-changed` event above. Only
+    // the assembled `assistant` events carry parsed tool_use inputs (the raw
+    // stream_events don't), so this is the one scan point.
+    if (evt.type === "assistant" && Array.isArray(evt.message?.content)) {
+      for (const b of evt.message.content) {
+        if (b && b.type === "tool_use" && FILE_MUTATING_TOOLS.has(b.name)) {
+          const p = b.input?.file_path || b.input?.notebook_path;
+          if (typeof p === "string" && p) this.turnFiles.push(p);
+        }
+      }
     }
     // Track in-flight control requests so they can be replayed to a client that
     // re-subscribes (e.g. after switching away mid-prompt in confirm mode). Dedup
@@ -438,7 +496,7 @@ class Session extends EventEmitter {
     this.emit("event", { type: "claude", data: evt, sessionId: this.id });
   }
 
-  async send(text, attachments = [], uid) {
+  async send(text, attachments = [], uid, opts = {}) {
     if (!this.proc || this.ended) {
       this.emit("event", { type: "error", sessionId: this.id, message: "session is not running" });
       return false;
@@ -474,7 +532,9 @@ class Session extends EventEmitter {
     // this session's cwd (global + this workspace) and, on a clear match,
     // prepend the skill's body to the message. Conservative + respects
     // disable-model-invocation and slash commands (see skills.js pickSkill).
-    if (userText.trim() && !userText.trim().startsWith("/")) {
+    // opts.noSkill skips matching (used by compaction's seed message — a
+    // summary of past work shouldn't pull a runbook into the new session).
+    if (userText.trim() && !userText.trim().startsWith("/") && !opts.noSkill) {
       try {
         const skills = await availableSkillsForCwd(this.cwd);
         const match = pickSkill(userText, skills);
@@ -708,6 +768,73 @@ function evictOldestIdle() {
   if (oldest) oldest.stop();
 }
 
+// One-shot `claude -p` used by compaction: render the transcript as plain
+// text (transcript.js readConversationText) and summarize it into a dense
+// handoff note. Runs with the SAME env/routing as the session (Session.env())
+// so the summary comes from a model the gateway can actually serve. The
+// prompt rides on stdin (it can be hundreds of KB, too big for argv).
+const COMPACT_PROMPT = [
+  "You are compacting a coding-assistant conversation. Produce a dense handoff summary",
+  "in markdown for the engineer who will continue the work. Cover, in this order:",
+  "1. Goal — what the user is trying to accomplish.",
+  "2. Decisions made and their rationale.",
+  "3. Current state — what works, what is in progress, what failed.",
+  "4. Files changed / created / deleted (paths as they appeared).",
+  "5. Commands, endpoints, and environment facts that came up.",
+  "6. Open questions and explicit next steps.",
+  "Keep it under ~1200 words. Prefer concrete identifiers (paths, commands, values) over prose.",
+  "",
+  "<conversation>",
+].join("\n");
+
+function summarizeOnce(session, conversationText) {
+  return new Promise((resolve, reject) => {
+    let proc;
+    try {
+      proc = spawn("claude", ["-p"], { cwd: session.cwd, env: session.env(), stdio: ["pipe", "pipe", "pipe"] });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    let out = "";
+    let err = "";
+    const timer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      reject(new Error("summarize timed out after 240s"));
+    }, 240000);
+    proc.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    proc.stdout.on("data", (d) => {
+      out += d;
+      if (out.length > 400_000) {
+        try {
+          proc.kill();
+        } catch {
+          /* cap enforced by the kill */
+        }
+      }
+    });
+    proc.stderr.on("data", (d) => {
+      err += d;
+    });
+    proc.on("exit", (code) => {
+      clearTimeout(timer);
+      const text = out.trim();
+      if (code === 0 && text) resolve(text);
+      else reject(new Error(err.trim().split("\n").slice(-3).join(" ") || `claude -p exited with code ${code}`));
+    });
+    proc.stdin.on("error", () => {});
+    proc.stdin.write(`${COMPACT_PROMPT}\n${conversationText}\n</conversation>`);
+    proc.stdin.end();
+  });
+}
+
 export const SessionManager = {
   /** Start a new session or resume an existing one. Returns sessionId. */
   start({ cwd, sessionId, model, confirm }) {
@@ -834,18 +961,84 @@ export const SessionManager = {
     return true;
   },
 
+  // Compact a session: render its transcript as plain text, summarize it with
+  // a one-shot `claude -p`, and start a successor session seeded with the
+  // summary. The old chat's process is stopped (its entry + transcript stay,
+  // so the old conversation is still readable). Returns { ok, newId } or
+  // { error }. Clients subscribed to the old session get a `compacted` event
+  // naming the successor so they can follow it.
+  async compact(sessionId) {
+    const s = sessions.get(sessionId);
+    if (!s) return { error: "no such session" };
+    if (s.busy) return { error: "session is busy — wait for the current turn to finish" };
+    const engine = routeForModel(s.model).engine;
+    if (engine) return { error: `compaction runs on the claude engine; this chat is on the ${engine} engine` };
+    const conv = await readConversationText(s.cwd, s.id);
+    if (!conv.count) return { error: "this session has no history to compact" };
+    let summary;
+    try {
+      summary = await summarizeOnce(s, conv.text);
+    } catch (e) {
+      return { error: `summarizing the session failed: ${e.message}` };
+    }
+    // Start the successor: a brand-new session id, same cwd/model/mode, then
+    // seed it with the summary. SessionManager.start enforces the concurrency
+    // cap for the extra process; the old one is stopped below.
+    const newId = crypto.randomUUID();
+    this.start({ cwd: s.cwd, sessionId: newId, model: s.model, confirm: s.confirm });
+    const sess = sessions.get(newId);
+    if (!sess) return { error: "failed to start the compacted session" };
+    sess.title = `${s.title || s.id.slice(0, 8)} (compact)`;
+    saveState();
+    const seed =
+      "[Session continuation — the previous conversation was compacted to free context. " +
+      "A summary follows. Pick up from this state; do not re-explain it.]\n\n" +
+      `${summary}\n\n` +
+      "[Reply with one short line confirming you are ready to continue.]";
+    const ok = await sess.send(seed, [], undefined, { noSkill: true });
+    if (!ok) return { error: "failed to seed the compacted session" };
+    // Free the old chat's ~300MB process; the map entry + transcript stay so
+    // the user can still open and read the old conversation.
+    s.stop();
+    s.emit("event", { type: "compacted", sessionId: s.id, newId });
+    emitStatus();
+    return { ok: true, newId };
+  },
+
   list() {
-    return [...sessions.values()].map(({ id, cwd, title, createdAt, model, busy, ended, confirm, metrics }) => ({
-      id,
-      cwd,
-      title,
-      createdAt,
-      model,
-      busy: !!busy,
-      ended: !!ended,
-      confirm: !!confirm,
-      metrics: metrics || null,
-    }));
+    return [...sessions.values()].map((s) => {
+      const { id, cwd, title, createdAt, model, busy, ended, confirm, metrics, lastActivity } = s;
+      // Enrich with cheap-but-useful metadata for the sidebar: which engine
+      // drives the chat, how big its transcript has grown (bytes), and the
+      // context occupancy vs the model's declared window (see config.js).
+      const engine = routeForModel(model).engine || "claude";
+      let bytes = 0;
+      const logPath = sessionLogPath(cwd, id);
+      if (logPath) {
+        try {
+          bytes = statSync(logPath).size;
+        } catch {
+          /* no transcript yet */
+        }
+      }
+      const window_ = contextWindowFor(model);
+      const used = metrics?.contextTokens || 0;
+      return {
+        id,
+        cwd,
+        title,
+        createdAt,
+        model,
+        busy: !!busy,
+        ended: !!ended,
+        confirm: !!confirm,
+        metrics: metrics || null,
+        lastActivity: lastActivity || null,
+        engine,
+        bytes,
+        context: { used, window: window_, pct: window_ ? used / window_ : 0 },
+      };
+    });
   },
 
   get(sessionId) {

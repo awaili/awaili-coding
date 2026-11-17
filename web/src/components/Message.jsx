@@ -17,7 +17,7 @@ function fmtSize(n) {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function Message({ msg }) {
+function Message({ msg, onOpenFile, cwd }) {
   if (msg.role === "user") {
     const images = Array.isArray(msg.images) ? msg.images : [];
     const files = Array.isArray(msg.files) ? msg.files : [];
@@ -56,7 +56,8 @@ function Message({ msg }) {
       <div className="bubble">
         {blocks.map((b, i) => {
           if (b.type === "text") return <Markdown key={b.id || i} text={b.text} />;
-          if (b.type === "tool_use") return <ToolCard key={b.id || i} block={b} />;
+          if (b.type === "tool_use")
+            return <ToolCard key={b.id || i} block={b} onOpenFile={onOpenFile} cwd={cwd} />;
           if (b.type === "thinking")
             return (
               <details key={i} style={{ color: "var(--muted)", fontSize: 12, margin: "6px 0" }}>

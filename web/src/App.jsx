@@ -14,6 +14,9 @@ import Skills from "./components/Skills.jsx";
 // The usage panel pulls four provider quota APIs + a transcript ledger; it is
 // only opened on demand, so keep it out of the initial bundle.
 const Usage = lazy(() => import("./components/Usage.jsx"));
+// Same story for the artifacts panel — it re-scans the session transcript
+// on open, which nobody needs on the initial page load.
+const Artifacts = lazy(() => import("./components/Artifacts.jsx"));
 import ModelPicker from "./components/ModelPicker.jsx";
 import Lightbox from "./components/Lightbox.jsx";
 import Login from "./components/Login.jsx";
@@ -110,7 +113,7 @@ function VisionNote({ note }) {
   );
 }
 
-function MetricsBar({ metrics }) {
+function MetricsBar({ metrics, context, onCompact, compacting }) {
   if (!metrics) return null;
   const inT = metrics.inputTokens || 0;
   const outT = metrics.outputTokens || 0;
@@ -119,8 +122,16 @@ function MetricsBar({ metrics }) {
   const cost = formatCost(metrics.totalCostUsd);
   const dur = formatDuration(metrics.totalDurationMs);
   const turns = metrics.totalTurns;
+  // Context gauge: how full the model's window is after the last turn. The
+  // server declares each model's window (CONTEXT_WINDOWS; see config.js), and
+  // `used` is last-turn input + cache — what every following turn re-sends.
+  // Color reinforces the number, never replaces it.
+  const ctxUsed = metrics.contextTokens || 0;
+  const ctxWin = context?.window || 0;
+  const ctxPct = ctxWin ? Math.min(1, ctxUsed / ctxWin) : 0;
+  const ctxLevel = ctxPct >= 0.75 ? "high" : ctxPct >= 0.5 ? "warn" : "ok";
   return (
-    <div className="metrics-bar" title="Last-turn tokens · cumulative session cost / duration / turns">
+    <div className="metrics-bar" title="Last-turn tokens · context occupancy · cumulative session cost / duration / turns">
       <span className="metrics-label">last turn</span>
       <span className="metrics-pair" title={`input ${inT} · output ${outT} · cache read ${cacheR} · cache write ${cacheW}`}>
         <span className="metrics-tok-in">↑{formatTokens(inT)}</span>
@@ -138,6 +149,32 @@ function MetricsBar({ metrics }) {
         {dur != null && <span title="cumulative wall-clock duration">{dur}</span>}
         {turns != null && <span title="cumulative turns">{turns}t</span>}
       </span>
+      {ctxWin > 0 && (
+        <>
+          <span className="metrics-sep">·</span>
+          <span
+            className={`ctx-gauge ${ctxLevel}`}
+            title={`context occupancy: ${ctxUsed} of the declared ${ctxWin}-token window (per-model size is an approximation — set CONTEXT_WINDOWS to correct it)`}
+          >
+            <span className="ctx-text">
+              ctx {formatTokens(ctxUsed)}/{formatTokens(ctxWin)} · {Math.floor(ctxPct * 100)}%
+            </span>
+            <span className="ctx-bar">
+              <span className="ctx-fill" style={{ width: `${ctxPct * 100}%` }} />
+            </span>
+          </span>
+          {onCompact && (
+            <button
+              className="ctx-compact"
+              onClick={onCompact}
+              disabled={compacting}
+              title="Summarize this chat and continue it in a fresh session (the old chat stays readable)"
+            >
+              {compacting ? "compacting…" : "⇲ Compact"}
+            </button>
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -174,6 +211,14 @@ export default function App() {
   const [termMode, setTermMode] = useState(null); // null | "tui" | "shell"
   const [skillsOpen, setSkillsOpen] = useState(false); // Skills manager overlay
   const [usageOpen, setUsageOpen] = useState(false); // Usage/quota overlay
+  const [artifactsOpen, setArtifactsOpen] = useState(false); // session artifacts overlay
+  // Compact (compress-and-continue): set while the server summarizes the chat
+  // into a successor session; cleared by the `compacted` reply / any error.
+  const [compacting, setCompacting] = useState(false);
+  // Bumped on every `fs-changed` event (the session's tools wrote files). The
+  // FileTree watches it to re-fetch the nodes it has open, so agentic edits
+  // show up without a manual refresh.
+  const [fsVersion, setFsVersion] = useState(0);
   const [editFile, setEditFile] = useState(null); // { path, cwd } when editing a file in main area
   const [authed, setAuthed] = useState(null); // null=checking, false=show login, true=app
   const [toast, setToast] = useState(""); // transient server error banner
@@ -192,6 +237,10 @@ export default function App() {
   // message. Streaming tokens don't set it — those only follow if the user is
   // already at the bottom (see the auto-scroll effect).
   const pinBottomRef = useRef(true);
+  // The successor session adopted by the most recent compact, so a duplicate
+  // `compacted` event (session broadcast + WS reply both arrive) doesn't
+  // re-subscribe / re-toast. Cleared when a different successor appears.
+  const compactFollowRef = useRef(null);
   const toastTimer = useRef(null);
   // Transcriptions of images that were sent to a text-only model, keyed by
   // session id and then by the user message's uid, so each note renders under
@@ -480,8 +529,48 @@ export default function App() {
           "This session has passed 12MB and is approaching the gateway's 16MB request limit. Start a new session soon (the old one stays readable) before every message starts failing.",
         );
         break;
+      case "context-high":
+        // The session's context crossed the configured occupancy threshold
+        // (CONTEXT_HIGH_PCT, default 75%). Purely informational — the metrics
+        // bar already colors it — but a toast makes it visible even when the
+        // bar is scrolled out of view. The server re-arms the warning below
+        // 80% of the threshold, so this won't fire on every turn once high.
+        flashToast(
+          `Context is getting full (~${Math.round((evt.pct || 0) * 100)}% of the window used). Compact this chat to keep it fast and cheap.`,
+        );
+        break;
+      case "compacting":
+        // The server is summarizing this session into a successor (see
+        // SessionManager.compact). Expect a `compacted` event when it's done.
+        setCompacting(true);
+        flashToast("Compacting — summarizing the chat into a new session…");
+        break;
+      case "compacted": {
+        // Both the session broadcast and the direct reply to the compact
+        // request carry this event, so the follow-through must be idempotent:
+        // the ref remembers which successor we've already adopted.
+        const { sessionId, newId } = evt;
+        if (!newId || !sessionId || compactFollowRef.current === newId) break;
+        compactFollowRef.current = newId;
+        setCompacting(false);
+        flashToast("Compact done — continuing in a fresh session (the old chat stays readable)");
+        suppressAutoScrollRef.current = false; // successor seeds with a summary
+        pinBottomRef.current = true;
+        setActiveId(newId);
+        sendRef.current?.({ type: "subscribe", sessionId: newId });
+        break;
+      }
+      case "fs-changed":
+        // The session's tools wrote workspace files this turn (Edit / Write /
+        // MultiEdit / NotebookEdit). Bump the counter so the FileTree re-fetches
+        // its open nodes; the chat keeps streaming while the tree catches up.
+        setFsVersion((v) => v + 1);
+        break;
       case "error":
         console.error("server error", evt.message);
+        // Errors that name a session mean that action failed — for compact the
+        // button would otherwise stay stuck on "compacting…". Clear it.
+        if (evt.sessionId) setCompacting(false);
         flashToast(evt.message || "server error");
         break;
       default:
@@ -736,6 +825,12 @@ export default function App() {
           outputTokens: u.output_tokens || 0,
           cacheReadTokens: u.cache_read_input_tokens || 0,
           cacheCreationTokens: u.cache_creation_input_tokens || 0,
+          // Context occupancy: everything a following turn re-sends (input +
+          // both cache components). This is the number the context gauge and
+          // the `context-high` warning are about; the window comes from the
+          // session's `context` field in the sessions broadcast.
+          contextTokens:
+            (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0),
           totalCostUsd: typeof data.total_cost_usd === "number" ? data.total_cost_usd : null,
           totalDurationMs: typeof data.duration_ms === "number" ? data.duration_ms : null,
           totalTurns: typeof data.num_turns === "number" ? data.num_turns : null,
@@ -763,6 +858,24 @@ export default function App() {
     suppressAutoScrollRef.current = false; // fresh chat lands at the bottom
     pinBottomRef.current = true;
     send({ type: "start", cwd, model: selectedModel, confirm: confirmMode });
+  }
+
+  // Compact the active chat (compress-and-continue): the server renders the
+  // transcript to text, asks a one-shot claude -p run to write a handoff
+  // summary, then starts a successor session seeded with it. The old entry
+  // stays in the sidebar and remains readable. Claude-engine sessions only
+  // (codex/grok have no equivalent resume semantics server-side).
+  function compactActive() {
+    if (!activeId) return;
+    if (compacting) return;
+    if (
+      !window.confirm(
+        "Compact this chat? The conversation is summarized and continued in a fresh session — details not carried into the summary are lost from the new chat's context. The old chat stays readable in the sidebar.",
+      )
+    )
+      return;
+    setCompacting(true);
+    send({ type: "compact", sessionId: activeId });
   }
 
   // Apply a model choice. With a chat open, this restarts the active session
@@ -1028,6 +1141,10 @@ export default function App() {
   const busy = activeId ? !!busyBy[activeId] : false;
   const activeCwd = activeId ? cwdBy[activeId] : selectedCwd;
   const activeMetrics = activeId ? metricsBy[activeId] || null : null;
+  // The active session's record from the last broadcast — its `context`
+  // (window size for its model) and `engine` drive the metrics-bar gauge and
+  // the Artifacts overlay's session id.
+  const activeSession = activeId ? sessions.find((s) => s.id === activeId) || null : null;
   // Sessions are scoped to the selected workspace (each session's cwd IS its
   // workspace). The full list is still held in `sessions` so switching back is
   // instant; we just filter what the sidebar shows. Mirror the live busyBy
@@ -1139,6 +1256,13 @@ export default function App() {
             {confirmMode ? "Confirm ✓" : "Confirm"}
           </button>
           <button onClick={() => setSkillsOpen(true)} title="Manage Claude Code skills">Skills</button>
+          <button
+            onClick={() => setArtifactsOpen(true)}
+            disabled={!activeId}
+            title="Files this chat touched (from the transcript), with a one-click zip"
+          >
+            Artifacts
+          </button>
           <button onClick={() => setUsageOpen(true)} title="Usage & quota across every model subscription">Usage</button>
           <button
             className="nav-btn nav-files"
@@ -1175,7 +1299,7 @@ export default function App() {
           )}
           {activeMsgs.map((m, i) => (
             <Fragment key={m.id || m.uid || `u${i}`}>
-              <Message msg={m} />
+              <Message msg={m} onOpenFile={openFile} cwd={activeCwd} />
               {m.uid && visionNotes[activeId]?.[m.uid] && (
                 <VisionNote note={visionNotes[activeId][m.uid]} />
               )}
@@ -1192,7 +1316,14 @@ export default function App() {
           </div>
         )}
 
-        {activeMetrics && <MetricsBar metrics={activeMetrics} />}
+        {activeMetrics && (
+          <MetricsBar
+            metrics={activeMetrics}
+            context={activeSession?.context}
+            onCompact={activeSession && activeSession.engine !== "claude" ? null : compactActive}
+            compacting={compacting}
+          />
+        )}
 
         <Composer onSend={sendMessage} onStop={stop} busy={busy} disabled={!activeId} />
           </>
@@ -1206,6 +1337,7 @@ export default function App() {
         onDeleteFile={handleFileDeleted}
         onMoveFile={handleFileMoved}
         activePath={editFile?.path}
+        fsVersion={fsVersion}
       />
 
       {nav && <div className="nav-backdrop" onClick={() => setNav(null)} />}
@@ -1239,6 +1371,17 @@ export default function App() {
       {usageOpen && (
         <Suspense fallback={null}>
           <Usage onClose={() => setUsageOpen(false)} />
+        </Suspense>
+      )}
+
+      {artifactsOpen && (
+        <Suspense fallback={null}>
+          <Artifacts
+            sessionId={activeId}
+            cwd={activeCwd}
+            onOpenFile={openFile}
+            onClose={() => setArtifactsOpen(false)}
+          />
         </Suspense>
       )}
 

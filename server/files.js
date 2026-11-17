@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, raw as rawBody } from "express";
 import { readdir, readFile, writeFile, stat, rmdir, rm, rename } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { dirname, basename, join, relative, sep } from "node:path";
@@ -165,6 +165,41 @@ router.post("/files/move", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// POST /api/files/upload?cwd=<abs>&path=<rel>  body: raw file bytes
+//   (Content-Type: application/octet-stream) -> { ok, path, bytes }
+// Binary-safe upload into the workspace — the piece PUT /api/files can't do
+// (it only carries utf8 text inside JSON). Same confinement as PUT, same
+// 20mb cap as the JSON body limit. The frontend's tree uses it for the
+// "Upload" button; chat attachments deliberately DON'T go through here (they
+// ride the WS into the conversation context instead).
+router.post(
+  "/files/upload",
+  rawBody({ type: ["application/octet-stream", "application/x-binary", "image/*", "text/*"], limit: "20mb" }),
+  async (req, res) => {
+    const root = confinedCwd(req.query.cwd);
+    if (!root) return res.status(400).json({ error: "workspace outside WORKSPACE_ROOT" });
+    const sub = req.query.path ? String(req.query.path) : "";
+    if (!sub) return res.status(400).json({ error: "path required" });
+    const target = safe(root, sub);
+    if (!target) return res.status(400).json({ error: "path outside workspace" });
+    const buf = Buffer.isBuffer(req.body) ? req.body : null;
+    if (!buf || buf.length === 0) return res.status(400).json({ error: "no file body received" });
+    try {
+      const st = await stat(target);
+      if (st.isDirectory()) return res.status(400).json({ error: "path is a directory" });
+    } catch {
+      // not yet present — fine, we'll create it
+    }
+    try {
+      await mkdirp(dirname(target));
+      await writeFile(target, buf);
+      res.json({ ok: true, path: sub, bytes: buf.length });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
 
 // GET /api/workspaces -> list of dirs under WORKSPACE_ROOT (per-session working dirs)
 router.get("/workspaces", async (_req, res) => {

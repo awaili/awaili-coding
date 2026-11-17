@@ -377,3 +377,69 @@ test("a rewritten (shrunk) transcript is fully rescanned, not extended", async (
   await writeLog(userText("no images here"));
   assert.equal(await transcript.embeddedImageBytes(cwd, sessionId), 0);
 });
+
+// --- readConversationText (compact summarizer input) -----------------------
+// Renders the transcript to plain text for the one-shot `claude -p` handoff
+// summary in SessionManager.compact. The contract that matters: every turn is
+// there (user says, assistant says, one-line tool traces) but tool RESULTS and
+// skill preambles are not — results would blow the prompt budget, and the
+// preamble would make the summarizer re-inject the skill.
+
+test("readConversationText renders user/assistant/tool lines and skips results", async () => {
+  await writeLog(
+    userText("fix the bug"),
+    rec({
+      type: "user",
+      uuid: "r1",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_1", content: "40 KB of file body".repeat(500) }] },
+    }),
+    rec({
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        id: "m-a1",
+        content: [
+          { type: "text", text: "on it" },
+          { type: "tool_use", id: "tu_1", name: "Edit", input: { file_path: "/data/x.js", old_string: "a", new_string: "b" } },
+        ],
+      },
+    }),
+    userText("done?"),
+    rec({
+      type: "assistant",
+      uuid: "a2",
+      message: { id: "m-a2", content: [{ type: "text", text: "yes, fixed" }] },
+    }),
+  );
+  const { text, count } = await transcript.readConversationText(cwd, sessionId);
+  assert.equal(count, 4);
+  assert.match(text, /USER: fix the bug/);
+  assert.match(text, /ASSISTANT: on it\nTOOL Edit \/data\/x\.js/);
+  assert.match(text, /USER: done\?/);
+  assert.match(text, /ASSISTANT: yes, fixed/);
+  // The tool_result body must not ride along into the summarizer prompt.
+  assert.ok(!text.includes("file body"));
+});
+
+test("readConversationText strips the injected skill preamble and clips long turns", async () => {
+  const wrapped = util.injectSkill(
+    { name: "deploy-site", scope: "global", body: "# steps\n1. do the thing" },
+    "上线 example.com",
+  );
+  const long = "x".repeat(50);
+  await writeLog(userText(wrapped), userText(long.repeat(200)));
+  const { text, count } = await transcript.readConversationText(cwd, sessionId, { maxChars: 1000, perMsg: 6000 });
+  assert.equal(count, 2);
+  assert.match(text, /USER: 上线 example\.com/);
+  assert.ok(!text.includes("[Active skill:"));
+  assert.ok(!text.includes("[SKILL CONTENT]"));
+  // The 10000-char turn is clipped to perMsg with a marker, and the total
+  // stays within budget.
+  assert.match(text, /\[…truncated\]/);
+  assert.ok(text.length < 7000);
+  // A missing transcript is an empty render, not a throw.
+  assert.deepEqual(
+    await transcript.readConversationText(cwd, "eeeeeeee-0000-0000-0000-000000000000"),
+    { text: "", count: 0 },
+  );
+});

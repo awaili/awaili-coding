@@ -190,6 +190,25 @@ async function handle(ws, msg) {
       return;
     }
 
+    case "compact": {
+      // Compact the active chat: summarize its transcript and continue in a
+      // successor session (see SessionManager.compact). The reply names the
+      // successor so the client can subscribe to it; clients still attached
+      // to the old session ALSO get a `compacted` event, so every watcher
+      // follows. Long-running (a one-shot claude -p summarize pass), so ack
+      // with a `compacting` event first so the UI can show progress.
+      if (!msg.sessionId || !ID_RE.test(msg.sessionId))
+        return ws.send(JSON.stringify({ type: "error", message: "invalid sessionId" }));
+      const sess = SessionManager.get(msg.sessionId);
+      if (!sess) return ws.send(JSON.stringify({ type: "error", message: "no such session" }));
+      if (sess.busy)
+        return ws.send(JSON.stringify({ type: "error", message: "session is busy — wait for the turn to finish" }));
+      sess.emit("event", { type: "compacting", sessionId: msg.sessionId });
+      const r = await SessionManager.compact(msg.sessionId);
+      if (r.error) return ws.send(JSON.stringify({ type: "error", sessionId: msg.sessionId, message: r.error }));
+      return ws.send(JSON.stringify({ type: "compacted", sessionId: msg.sessionId, newId: r.newId }));
+    }
+
     case "subscribe": {
       // Re-attach to a session WITHOUT (re)spawning claude. Used when re-picking
       // a session that is already running in the background: the `start` action

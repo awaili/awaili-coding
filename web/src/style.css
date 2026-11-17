@@ -822,3 +822,160 @@ input, textarea { font-family: inherit; }
   .ug-head { flex-wrap: wrap; }
   .ug-table td.ug-share, .ug-table th:nth-child(2) { display: none; }
 }
+
+/* ===== skills-manager additions ===== */
+/* Manage tab: row action buttons (auto-injection toggle / export / rename). */
+.skills-act {
+  flex: none; padding: 0 5px; border-radius: 5px; line-height: 18px; font-size: 12px;
+  color: var(--muted); background: none; border: none; cursor: pointer; text-decoration: none;
+}
+.skills-act:hover { color: var(--text); background: var(--bg); }
+.skills-auto.on { color: var(--ok); }
+.skills-auto.off { opacity: .5; }
+.skills-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.skills-chips .skills-badge {
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+  display: inline-block; white-space: nowrap;
+}
+
+/* Manage tab: test-triggers panel pinned under the split. */
+.skills-test { flex: none; border-top: 1px solid var(--border); background: var(--panel-2); }
+.skills-test-head {
+  display: flex; align-items: center; gap: 8px; padding: 5px 12px;
+  font-size: 12px; color: var(--muted); cursor: pointer; user-select: none;
+}
+.skills-test-head:hover { color: var(--text); }
+.skills-test-head .spacer { flex: 1; }
+.skills-test-body { padding: 2px 12px 10px; display: flex; flex-direction: column; gap: 6px; }
+.skills-test-row { display: flex; gap: 8px; }
+.skills-test-row input { flex: 1; min-width: 0; }
+.skills-test-error { color: var(--err); font-size: 12px; }
+.skills-test-result { max-height: 200px; overflow: auto; }
+.skills-test-inject { font-size: 12px; margin-bottom: 4px; }
+.skills-test-inject.ok { color: var(--ok); }
+.skills-test-inject.muted { color: var(--muted); }
+.skills-test-empty { color: var(--muted); font-size: 12px; padding: 4px 0; }
+.skills-rank { width: 100%; border-collapse: collapse; font-size: 12px; }
+.skills-rank th {
+  text-align: left; color: var(--muted); font-weight: 500;
+  padding: 2px 10px 2px 0; border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: var(--panel-2);
+}
+.skills-rank td { padding: 3px 10px 3px 0; vertical-align: top; }
+.skills-rank tr.picked td { color: var(--ok); }
+.skills-rank-name { font-family: var(--mono); white-space: nowrap; }
+.skills-rank-name .skills-badge { margin-left: 6px; }
+.skills-rank-matched .skills-badge { display: inline-block; margin: 0 4px 2px 0; }
+
+/* ===== artifact ux additions ===== */
+/* DiffView: two line-number columns + fold bar for unchanged runs */
+.diff .dl { display: flex; align-items: baseline; }
+.diff .ln { flex: 0 0 3em; text-align: right; padding-right: 6px; color: var(--muted); opacity: .7; user-select: none; }
+.diff .sig { flex: 0 0 1.2em; text-align: center; user-select: none; }
+.diff .txt { flex: 1 1 auto; white-space: pre; }
+.diff .fold { cursor: pointer; color: var(--muted); background: var(--panel-2); border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); padding: 1px 0 1px 2em; user-select: none; }
+.diff .fold:hover { color: var(--accent); }
+
+/* ToolCard header: change stats + open-in-editor button */
+.tool .head .stats { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: nowrap; }
+.tool .head .summary { flex: 1 1 auto; min-width: 0; }
+.tool .head .openbtn { margin-left: auto; flex: 0 0 auto; background: transparent; border: none; color: var(--muted); font-size: 11px; font-family: var(--mono); padding: 1px 5px; border-radius: 4px; cursor: pointer; }
+.tool .head .openbtn:hover { color: var(--accent); background: var(--bg); }
+
+/* MultiEdit body: one diff block per edit */
+.tool .body .multiedit { margin-top: 6px; }
+.tool .body .multiedit:first-of-type { margin-top: 0; }
+
+/* Compact always-expanded task tool cards (TodoWrite/TaskCreate/TaskUpdate) */
+.tool.tasktool .head { cursor: default; }
+.tool .taskbody { padding: 6px 10px; font-size: 12.5px; }
+.tool .taskbody .todolist { display: flex; flex-direction: column; gap: 2px; }
+.tool .taskbody .todoitem { display: flex; gap: 7px; align-items: baseline; }
+.tool .taskbody .taskline { display: flex; gap: 7px; align-items: baseline; }
+.tool .taskbody .tstatus { flex: 0 0 auto; color: var(--muted); }
+.tool .taskbody .tcontent { min-width: 0; }
+.tool .taskbody .tdone { text-decoration: line-through; color: var(--muted); }
+.tool .taskbody .taskname { font-family: var(--mono); font-weight: 600; }
+.tool .taskbody .taskarrow { color: var(--muted); }
+.tool .taskbody .taskstatus { font-family: var(--mono); color: var(--muted); }
+.tool .taskbody .taskdesc { color: var(--muted); }
+
+/* ===== harness management additions ===== */
+/* Context gauge in the metrics bar: occupancy of the model's window after the
+   last turn (see App.jsx MetricsBar). Color tracks the server's context-high
+   threshold (75%) — muted below half, warn at 50%, high/err at 75%+. */
+.ctx-gauge { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.ctx-gauge .ctx-text { white-space: nowrap; }
+.ctx-gauge.warn .ctx-text { color: var(--warn); }
+.ctx-gauge.high .ctx-text { color: var(--err); }
+.ctx-bar { width: 72px; height: 5px; border-radius: 3px; background: var(--panel-2); border: 1px solid var(--border); overflow: hidden; display: inline-block; }
+.ctx-fill { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+.ctx-gauge.warn .ctx-fill { background: var(--warn); }
+.ctx-gauge.high .ctx-fill { background: var(--err); }
+.ctx-compact { font-family: inherit; font-size: 11px; padding: 2px 8px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); cursor: pointer; white-space: nowrap; }
+.ctx-compact:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.ctx-compact:disabled { opacity: .5; cursor: wait; }
+
+/* Sidebar row extras: engine badge (non-claude sessions only), context
+   occupancy badge (shown from the 75% context-high threshold up). */
+.engine-badge { font-size: 10px; line-height: 14px; padding: 0 5px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; margin-right: 4px; }
+.ctx-badge { font-size: 10px; line-height: 14px; padding: 0 5px; border-radius: 8px; border: 1px solid var(--warn); color: var(--warn); white-space: nowrap; margin-left: 4px; }
+.ctx-badge.critical { border-color: var(--err); color: var(--err); }
+
+/* Artifacts overlay (components/Artifacts.jsx): mirrors the usage panel's
+   ug-* layout conventions with its own art-* namespace. */
+.art-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center;
+}
+.art-panel {
+  width: min(880px, 96vw); height: 80vh;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; display: flex; flex-direction: column; overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+}
+.art-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+}
+.art-title { font-weight: 600; }
+.art-sub { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.art-head .spacer { flex: 1; }
+.art-zip {
+  font-size: 12px; padding: 4px 10px; text-decoration: none;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text);
+}
+.art-zip:hover { border-color: var(--accent); }
+.art-close {
+  font-size: 12px; padding: 4px 10px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+}
+.art-close:hover { background: var(--err); color: #fff; }
+.art-error {
+  margin: 8px 12px 0; padding: 6px 10px; background: var(--panel-2);
+  border: 1px solid var(--err); border-radius: 6px; color: var(--err); font-size: 12px;
+}
+.art-body { flex: 1; min-height: 0; overflow: auto; padding: 12px; }
+.art-empty { color: var(--muted); font-size: 12px; padding: 16px; }
+.art-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.art-table th {
+  text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--border);
+}
+.art-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.art-path { font-family: var(--mono); max-width: 420px; }
+.art-open {
+  font-family: var(--mono); font-size: 12px; background: none; border: none; padding: 0;
+  color: var(--text); cursor: pointer; text-align: left; word-break: break-all;
+}
+.art-open:hover { color: var(--accent); text-decoration: underline; }
+.art-outside { font-family: var(--mono); color: var(--muted); word-break: break-all; }
+.art-ops { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: nowrap; }
+.art-time { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.art-count { font-size: 11px; color: var(--muted); text-align: right; }
+@media (max-width: 720px) {
+  .art-panel { width: 100vw; height: 100vh; border-radius: 0; }
+  .art-head { flex-wrap: wrap; }
+}

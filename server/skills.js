@@ -75,8 +75,11 @@ function parseDescription(text) {
 }
 
 // GET /api/skills?scope=global|workspace&cwd=<abs>
-//   -> { dir, skills: [{ name, description }] }
-// Lists subdirectories of the skills dir that contain a SKILL.md.
+//   -> { dir, skills: [{ name, description, whenToUse, autoInvocation,
+//        userInvocable, allowedTools, argumentHint }] }
+// Lists subdirectories of the skills dir that contain a SKILL.md, parsed with
+// the same frontmatter reader the injector uses so the list view can show
+// trigger-relevant metadata (the toggle state above all).
 router.get("/skills", async (req, res) => {
   const dir = skillsDir(req.query.scope, req.query.cwd);
   if (!dir) return res.status(400).json({ error: "invalid scope or workspace outside WORKSPACE_ROOT" });
@@ -91,14 +94,22 @@ router.get("/skills", async (req, res) => {
   for (const e of entries) {
     if (!e.isDirectory() || e.name.startsWith(".")) continue;
     const md = join(dir, e.name, "SKILL.md");
-    let description = "";
+    let fm;
     try {
-      description = parseDescription(await readFile(md, "utf8"));
+      fm = parseSkillMd(await readFile(md, "utf8"));
     } catch {
       // No SKILL.md — skip this dir (not a valid skill).
       continue;
     }
-    skills.push({ name: e.name, description });
+    skills.push({
+      name: e.name,
+      description: fm.description,
+      whenToUse: fm.whenToUse,
+      autoInvocation: !fm.disableModelInvocation,
+      userInvocable: fm.userInvocable,
+      allowedTools: fm.allowedTools,
+      argumentHint: fm.argumentHint,
+    });
   }
   skills.sort((a, b) => a.name.localeCompare(b.name));
   res.json({ dir, skills });
@@ -259,6 +270,7 @@ router.post("/skills", async (req, res) => {
       await mkdirp(dirname(resolved));
       await writeFile(resolved, body, "utf8");
     }
+    bustSkillCache();
     res.json({ ok: true, name, files: Object.keys(files) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -274,7 +286,167 @@ router.delete("/skills", async (req, res) => {
   if (!target) return res.status(400).json({ error: "invalid skill name" });
   try {
     await rm(target, { recursive: true, force: false });
+    bustSkillCache();
     res.json({ ok: true, name });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Flip a skill's auto-invocation on/off by editing the `disable-model-invocation`
+// frontmatter line of its SKILL.md. That one field is the semantic toggle:
+// the claude CLI respects it natively AND pickSkill() skips such skills, so a
+// single edit silences both injection paths while `/name` stays manual.
+//   disable  -> set the line to `disable-model-invocation: true` (inserted
+//               right after the opening `---` when absent)
+//   enable   -> remove the line entirely (absence means false; an author's
+//               hand-written `false` is semantically identical, so removal is
+//               safe)
+export async function setModelInvocation(dir, name, disable) {
+  const mdPath = join(dir, name, "SKILL.md");
+  const raw = await readFile(mdPath, "utf8");
+  if (!raw.startsWith("---")) throw new Error("SKILL.md has no frontmatter to edit");
+  let next;
+  if (disable) {
+    if (/^disable-model-invocation:/m.test(raw)) {
+      next = raw.replace(/^(disable-model-invocation:\s*).*$/m, "$1true");
+    } else {
+      const m = raw.match(/^---\r?\n/);
+      if (!m) throw new Error("malformed frontmatter");
+      next = raw.replace(/^---\r?\n/, `${m[0]}disable-model-invocation: true\n`);
+    }
+  } else {
+    next = raw.replace(/^disable-model-invocation:\s*.*(?:\r?\n|$)/m, "");
+  }
+  await writeFile(mdPath, next, "utf8");
+}
+
+// POST /api/skills/toggle { scope, cwd, name, disabled } -> { ok, name, disabled }
+// Disable/enable a skill's AUTO-injection (see setModelInvocation). Manual
+// `/name` invocation keeps working either way.
+router.post("/skills/toggle", async (req, res) => {
+  const dir = skillsDir(req.body?.scope, req.body?.cwd);
+  if (!dir) return res.status(400).json({ error: "invalid scope or workspace outside WORKSPACE_ROOT" });
+  const name = String(req.body?.name || "");
+  const target = skillDir(dir, name);
+  if (!target) return res.status(400).json({ error: "invalid skill name" });
+  try {
+    await stat(join(target, "SKILL.md"));
+  } catch {
+    return res.status(404).json({ error: "skill not found (no SKILL.md)" });
+  }
+  try {
+    await setModelInvocation(dir, name, !!req.body?.disabled);
+    bustSkillCache();
+    res.json({ ok: true, name, disabled: !!req.body?.disabled });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/skills/rename { scope, cwd, name, toName, toScope? } -> { ok, name, toName, toScope }
+// Rename a skill and/or migrate it between scopes (global <-> workspace). The
+// directory name IS the /command name, so renaming changes how the skill is
+// invoked; migrating moves it between ~/.claude/skills and the workspace's
+// .claude/skills (which changes which chats can see it).
+router.post("/skills/rename", async (req, res) => {
+  const scope = req.body?.scope;
+  const cwd = req.body?.cwd;
+  const dir = skillsDir(scope, cwd);
+  const toScope = req.body?.toScope || scope;
+  const dstRoot = skillsDir(toScope, cwd);
+  if (!dir || !dstRoot)
+    return res.status(400).json({ error: "invalid scope or workspace outside WORKSPACE_ROOT" });
+  const name = String(req.body?.name || "");
+  const toName = String(req.body?.toName || "");
+  const src = skillDir(dir, name);
+  const dst = skillDir(dstRoot, toName);
+  if (!src || !dst) return res.status(400).json({ error: "invalid skill name" });
+  try {
+    await stat(src);
+  } catch {
+    return res.status(404).json({ error: "skill not found" });
+  }
+  try {
+    await stat(dst);
+    return res.status(400).json({ error: "destination already exists" });
+  } catch {
+    // absent — fine
+  }
+  try {
+    await mkdirp(dirname(dst));
+    await rename(src, dst);
+    bustSkillCache();
+    res.json({ ok: true, name, toName, scope, toScope });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/skills/export?scope=&cwd=&name= -> the skill directory as a .zip
+// stream (Content-Disposition: attachment). The inverse of /api/skills/upload:
+// round-trips through the same layout, so an exported skill re-imports
+// unchanged. Shell out to `zip` (no archiver dependency), matching upload's
+// `unzip`.
+router.get("/skills/export", async (req, res) => {
+  const dir = skillsDir(req.query.scope, req.query.cwd);
+  if (!dir) return res.status(400).json({ error: "invalid scope or workspace outside WORKSPACE_ROOT" });
+  const name = String(req.query.name || "");
+  const target = skillDir(dir, name);
+  if (!target) return res.status(400).json({ error: "invalid skill name" });
+  try {
+    await stat(join(target, "SKILL.md"));
+  } catch {
+    return res.status(404).json({ error: "skill not found (no SKILL.md)" });
+  }
+  try {
+    // NAME_RE has no path/hostile chars, so the filename is safe inline.
+    // encoding:"buffer" is essential: without it execFile decodes stdout as
+    // utf8 text and every byte sequence that isn't valid UTF-8 becomes
+    // replacement chars — the "zip" arrives corrupted.
+    const { stdout } = await execFileP("zip", ["-rq", "-", "."], {
+      cwd: target,
+      timeout: 60000,
+      maxBuffer: 128 * 1024 * 1024,
+      encoding: "buffer",
+      env: safeProcessEnv(), // see config.js SECRET_ENV_KEYS
+    });
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${name}.zip"`);
+    res.send(stdout);
+  } catch (e) {
+    if (/ENOENT|spawn zip/i.test(e.message || ""))
+      return res.status(500).json({ error: "zip is not installed on the server (required to export skills)" });
+    res.status(500).json({ error: e.message || "failed to zip the skill" });
+  }
+});
+
+// POST /api/skills/test { cwd, message } -> { message, injected, ranked }
+// Trigger calibration: run the REAL matcher (the same rankSkills/pickSkill the
+// send path uses) against a would-be message and return the full ranking with
+// per-skill scores, distinctive hits and matched keywords, plus what would
+// actually be injected. Let skill authors tune descriptions without a
+// round-trip through a live chat.
+router.post("/skills/test", async (req, res) => {
+  const cwd = String(req.body?.cwd || "");
+  const message = String(req.body?.message || "");
+  if (!message.trim()) return res.status(400).json({ error: "message required" });
+  try {
+    const skills = await availableSkillsForCwd(cwd);
+    const { scored } = rankSkills(message, skills);
+    const injected = pickSkill(message, skills);
+    res.json({
+      message,
+      injected: injected ? { name: injected.name, scope: injected.scope } : null,
+      ranked: scored.slice(0, 10).map(({ s, score, distinctive, matched }) => ({
+        name: s.name,
+        scope: s.scope,
+        score,
+        distinctive,
+        matched,
+        disabled: !!s.disableModelInvocation,
+      })),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -339,6 +511,7 @@ router.put("/skills/file", async (req, res) => {
   try {
     await mkdirp(join(resolved, ".."));
     await writeFile(resolved, String(req.body?.content ?? ""), "utf8");
+    bustSkillCache(); // a SKILL.md edit can change description/triggers
     res.json({ ok: true, path: sub });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -360,6 +533,7 @@ router.delete("/skills/file", async (req, res) => {
     return res.status(400).json({ error: "path outside skill" });
   try {
     await rm(resolved, { recursive: true, force: false });
+    bustSkillCache();
     res.json({ ok: true, path: sub });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -420,6 +594,7 @@ router.post("/skills/move", async (req, res) => {
   try {
     await mkdirp(join(dst, ".."));
     await rename(src, dst);
+    bustSkillCache(); // a moved SKILL.md/rename can change what the matcher sees
     res.json({ ok: true, from, to });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -695,6 +870,7 @@ router.post("/skills/import", async (req, res) => {
     return res.status(500).json({ error: e.message, written });
   }
   if (tmp) try { await rm(tmp, { recursive: true, force: true }); } catch {}
+  bustSkillCache();
   res.json({ ok: true, name, files: written, skipped: state.skipped });
 });
 
@@ -784,6 +960,7 @@ router.post(
       return res.status(500).json({ error: e.message, written });
     }
     if (tmp) try { await rm(tmp, { recursive: true, force: true }); } catch {}
+    bustSkillCache();
     res.json({ ok: true, name, files: written, skipped: state.skipped });
   },
 );
@@ -816,6 +993,8 @@ function parseSkillMd(raw) {
   let whenToUse = "";
   let disableModelInvocation = false;
   let userInvocable = true;
+  let allowedTools = "";
+  let argumentHint = "";
   if (text.startsWith("---")) {
     const end = text.indexOf("\n---", 3);
     if (end >= 0) {
@@ -825,9 +1004,11 @@ function parseSkillMd(raw) {
       whenToUse = fmLine(block, "when_to_use");
       disableModelInvocation = /^\s*true\s*$/i.test(fmLine(block, "disable-model-invocation"));
       userInvocable = !/^\s*false\s*$/i.test(fmLine(block, "user-invocable"));
+      allowedTools = fmLine(block, "allowed-tools");
+      argumentHint = fmLine(block, "argument-hint");
     }
   }
-  return { description, whenToUse, disableModelInvocation, userInvocable, body };
+  return { description, whenToUse, disableModelInvocation, userInvocable, allowedTools, argumentHint, body };
 }
 
 // Read every skill under `dir` (subdirs containing SKILL.md) into `out`, tagged
@@ -856,6 +1037,13 @@ async function loadSkillsIn(dir, scope, out) {
 // while a burst of sends in one turn doesn't re-read the files every message.
 const SKILL_CACHE_TTL = 10000;
 const skillCache = new Map();
+
+// Drop the per-cwd skill caches immediately. The TTL would catch up within
+// 10s anyway, but the mutation routes (create/delete/edit/move/import/toggle)
+// call this so the change is visible to the very next send.
+export function bustSkillCache() {
+  skillCache.clear();
+}
 
 // Skills available to a chat session with the given cwd: GLOBAL skills
 // (~/.claude/skills, every workspace) plus THIS WORKSPACE's skills
@@ -1004,6 +1192,48 @@ function keywordsOfMessage(text) {
   return words;
 }
 
+// Rank EVERY usable skill against the user's text: score = number of the
+// skill's keyword stems present in the message, distinctive = hits no other
+// installed skill claims, matched = the actual hitting keywords. This is the
+// inspectable core of the matcher — pickSkill() below applies the conservative
+// thresholds to it, and POST /api/skills/test returns the raw ranking so skill
+// authors can calibrate triggers from the UI.
+export function rankSkills(text, skills) {
+  if (typeof text !== "string" || !text.trim() || text.trim().startsWith("/"))
+    return { scored: [] };
+  const userWords = keywordsOfMessage(text);
+  const usable = skills.filter((s) => !s.disableModelInvocation && s.body && s.body.trim());
+  // Document frequency across the installed set: a keyword several skills share
+  // is vocabulary, not identity.
+  const df = new Map();
+  const kwByName = new Map();
+  for (const s of usable) {
+    const kw = keywordsFor(s);
+    kwByName.set(s.name, kw);
+    for (const k of kw) df.set(k, (df.get(k) || 0) + 1);
+  }
+  const scored = [];
+  for (const s of usable) {
+    let score = 0;
+    let distinctive = 0;
+    const matched = [];
+    for (const k of kwByName.get(s.name)) {
+      if (!userWords.has(k)) continue;
+      score += 1;
+      matched.push(k);
+      if (df.get(k) === 1) distinctive += 1;
+    }
+    if (score > 0) scored.push({ s, score, distinctive, matched });
+  }
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.distinctive !== a.distinctive) return b.distinctive - a.distinctive;
+    if (a.s.scope !== b.s.scope) return a.s.scope === "workspace" ? -1 : 1;
+    return b.s.name.length - a.s.name.length;
+  });
+  return { scored };
+}
+
 // Pick the single skill whose keywords best overlap the user's text.
 // Conservative by design (a false injection derails the answer — it prepends
 // a whole SKILL.md to a request that has nothing to do with it; a missed one
@@ -1021,36 +1251,8 @@ function keywordsOfMessage(text) {
 //   - on a tie, only inject if the winner is the workspace skill beating a
 //     global one (workspace wins by precedence); otherwise ambiguous -> none
 export function pickSkill(text, skills) {
-  if (typeof text !== "string" || !text.trim() || text.trim().startsWith("/")) return null;
-  const userWords = keywordsOfMessage(text);
-  const usable = skills.filter((s) => !s.disableModelInvocation && s.body && s.body.trim());
-  // Document frequency across the installed set: a keyword several skills share
-  // is vocabulary, not identity.
-  const df = new Map();
-  const kwByName = new Map();
-  for (const s of usable) {
-    const kw = keywordsFor(s);
-    kwByName.set(s.name, kw);
-    for (const k of kw) df.set(k, (df.get(k) || 0) + 1);
-  }
-  const scored = [];
-  for (const s of usable) {
-    let score = 0;
-    let distinctive = 0;
-    for (const k of kwByName.get(s.name)) {
-      if (!userWords.has(k)) continue;
-      score += 1;
-      if (df.get(k) === 1) distinctive += 1;
-    }
-    if (score > 0) scored.push({ s, score, distinctive });
-  }
+  const { scored } = rankSkills(text, skills);
   if (!scored.length) return null;
-  scored.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    if (b.distinctive !== a.distinctive) return b.distinctive - a.distinctive;
-    if (a.s.scope !== b.s.scope) return a.s.scope === "workspace" ? -1 : 1;
-    return b.s.name.length - a.s.name.length;
-  });
   const top = scored[0];
   if (top.score < 2) return null;
   if (!top.distinctive) return null;
